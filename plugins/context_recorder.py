@@ -22,6 +22,7 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
 from services.context_store import add_message
 from services.prompt_builder import sender_display_name
+from services.user_store import upsert_user
 
 # 优先级 20 > ai_chat 的 10：普通非 @ 群消息轮到本插件入库；
 # @机器人 的消息已被 ai_chat 拦截（block=True），不会走到这里重复保存。
@@ -48,6 +49,10 @@ async def handle(event: GroupMessageEvent):
         event.user_id,
         content,
     )
+
+    # 顺带记录用户身份（user_id 稳定身份 + 最近显示名）；
+    # 失败只记 ERROR（user_store 内部处理），不影响消息入库
+    await upsert_user(event.user_id, sender_display_name(event))
 
     # 保存失败只记 ERROR（context_store 内部处理），不影响任何消息流转
     await add_message(

@@ -25,9 +25,9 @@ from nonebot import logger
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
 from services import redact_secrets
-from services.context_store import DB_PATH
-from services.context_store import close_db
-from services.context_store import init_db
+from services.database import DB_PATH
+from services.database import close_db
+from services.database import init_db
 
 # 1. 把 .env 中的配置加载到环境变量。
 #    必须在读取任何配置之前执行，这样 NoneBot2 和 DeepSeek 客户端都能读到配置。
@@ -87,26 +87,45 @@ for provider in [AI_PROVIDER] + ([AI_FALLBACK] if AI_FALLBACK else []):
         )
         sys.exit(1)
 
-# 5. 加载 plugins/ 目录下的全部插件（ai_chat / context_recorder）。
+# 5. close 用户配置校验（必须在 load_dotenv 之后执行）：
+#    CLOSE_USER_ID 是 close 关系的唯一真相来源；空 = 没有 close 用户；
+#    非法值（非数字）在启动阶段直接报错退出，而不是运行到聊天时才暴露。
+#    注意：日志中绝不输出真实 CLOSE_USER_ID。
+try:
+    from services.relationship_service import CLOSE_USER_ID
+except ValueError as exc:
+    logger.error(
+        "[RELATIONSHIP] {}，请检查 .env 的 CLOSE_USER_ID 配置。",
+        redact_secrets(str(exc)),
+    )
+    sys.exit(1)
+
+if CLOSE_USER_ID is not None:
+    logger.info("[RELATIONSHIP] close target configured")
+else:
+    logger.info("[RELATIONSHIP] 未配置 close 用户（CLOSE_USER_ID 为空）")
+
+# 6. 加载 plugins/ 目录下的全部插件（ai_chat / context_recorder）。
 nonebot.load_plugins("plugins")
 
 
-# 6. 数据库生命周期钩子（NoneBot2 2.5.0 提供 driver.on_startup / on_shutdown，
+# 7. 数据库生命周期钩子（NoneBot2 2.5.0 提供 driver.on_startup / on_shutdown，
 #    见 nonebot/internal/driver/_lifespan.py；API 已对照本仓库安装版本确认）。
 @driver.on_startup
 async def _init_chat_history_db() -> None:
-    """启动时初始化 SQLite 群聊历史库（自动建 data/ 目录、库文件、messages 表）。
+    """启动时初始化 SQLite（自动建 data/ 目录、库文件与全部表：
+    messages / users / relationships / user_memories）。
 
     初始化失败只记录清晰 ERROR 日志，Bot 继续以“无上下文单轮问答”模式运行，
     且运行中每次读写会再尝试懒恢复。
     """
     try:
         await init_db()
-        logger.info("[CONTEXT] SQLite 群聊历史已就绪：{}", DB_PATH)
+        logger.info("[CONTEXT] SQLite 存储已就绪：{}", DB_PATH)
     except Exception as exc:
         logger.error(
-            "[CONTEXT] SQLite 初始化失败，群聊上下文功能暂时不可用"
-            "（单轮问答不受影响）：{}: {}",
+            "[CONTEXT] SQLite 初始化失败，群聊上下文 / 用户 / 关系 / 记忆功能"
+            "暂时不可用（单轮问答不受影响）：{}: {}",
             type(exc).__name__,
             redact_secrets(str(exc)),
         )
