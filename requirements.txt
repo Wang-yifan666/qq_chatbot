@@ -1,0 +1,20 @@
+# ===== NoneBot2 framework =====
+# NoneBot2 core (asyncio event loop, plugin loading, logging)
+nonebot2>=2.4.0
+
+# OneBot V11 protocol adapter (talks to NapCat)
+nonebot-adapter-onebot>=2.4.0
+
+# ===== Reverse WebSocket driver =====
+# NapCat connects to NoneBot2 via WebSocket, so we need FastAPI driver + uvicorn + websockets
+fastapi>=0.110.0
+uvicorn>=0.27.0
+websockets>=10.0
+
+# ===== DeepSeek API =====
+# Official OpenAI Python SDK (async AsyncOpenAI client). DeepSeek is OpenAI-compatible.
+openai>=1.40.0
+
+# ===== Environment variables =====
+# Loads the .env file into environment variables
+python-dotenv>=1.0.0
