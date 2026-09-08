@@ -15,6 +15,11 @@ websockets>=10.0
 # Official OpenAI Python SDK (async AsyncOpenAI client). DeepSeek is OpenAI-compatible.
 openai>=1.40.0
 
+# ===== SQLite (async, group chat history) =====
+# Async wrapper around sqlite3; used by services/context_store.py so that
+# NoneBot2 asyncio handlers never block the event loop on synchronous sqlite3.
+aiosqlite>=0.19.0
+
 # ===== Environment variables =====
 # Loads the .env file into environment variables
 python-dotenv>=1.0.0

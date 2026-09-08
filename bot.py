@@ -24,6 +24,11 @@ from dotenv import load_dotenv
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
+from services import redact_secrets
+from services.context_store import DB_PATH
+from services.context_store import close_db
+from services.context_store import init_db
+
 # 1. 把 .env 中的配置加载到环境变量。
 #    必须在读取任何配置之前执行，这样 NoneBot2 和 DeepSeek 客户端都能读到配置。
 load_dotenv()
@@ -82,8 +87,36 @@ for provider in [AI_PROVIDER] + ([AI_FALLBACK] if AI_FALLBACK else []):
         )
         sys.exit(1)
 
-# 5. 加载 plugins/ 目录下的全部插件（当前只有 ai_chat）。
+# 5. 加载 plugins/ 目录下的全部插件（ai_chat / context_recorder）。
 nonebot.load_plugins("plugins")
+
+
+# 6. 数据库生命周期钩子（NoneBot2 2.5.0 提供 driver.on_startup / on_shutdown，
+#    见 nonebot/internal/driver/_lifespan.py；API 已对照本仓库安装版本确认）。
+@driver.on_startup
+async def _init_chat_history_db() -> None:
+    """启动时初始化 SQLite 群聊历史库（自动建 data/ 目录、库文件、messages 表）。
+
+    初始化失败只记录清晰 ERROR 日志，Bot 继续以“无上下文单轮问答”模式运行，
+    且运行中每次读写会再尝试懒恢复。
+    """
+    try:
+        await init_db()
+        logger.info("[CONTEXT] SQLite 群聊历史已就绪：{}", DB_PATH)
+    except Exception as exc:
+        logger.error(
+            "[CONTEXT] SQLite 初始化失败，群聊上下文功能暂时不可用"
+            "（单轮问答不受影响）：{}: {}",
+            type(exc).__name__,
+            redact_secrets(str(exc)),
+        )
+
+
+@driver.on_shutdown
+async def _close_chat_history_db() -> None:
+    """进程退出前关闭数据库连接。"""
+    await close_db()
+
 
 if __name__ == "__main__":
     # 启动 NoneBot2（阻塞运行，Ctrl+C 退出）

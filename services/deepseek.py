@@ -1,6 +1,8 @@
-"""DeepSeek API 客户端封装。
+"""DeepSeek API 客户端封装（纯 LLM Transport 层）。
 
-本模块只负责一件事：把用户问题发给 DeepSeek，返回文本回答。
+本模块只负责一件事：把调用方构造好的 messages 发给 DeepSeek，返回文本回答。
+不负责人格、上下文、QQ 用户信息、群聊格式化（这些统一由
+services/prompt_builder.py 负责，保证主备服务商收到完全相同的 Prompt）。
 
 要点：
 - 使用 OpenAI 官方 SDK 的 AsyncOpenAI（异步客户端），不会阻塞
@@ -8,8 +10,7 @@
 - API Key 从环境变量 DEEPSEEK_API_KEY 读取，严禁硬编码；
 - 模型名从环境变量 DEEPSEEK_MODEL 读取，未配置时使用默认值 deepseek-v4-flash；
 - 客户端懒加载：首次调用时才创建。这样当 .env 里 AI_PROVIDER=zhipu
-  （即本次不选用 DeepSeek）时，缺少 DEEPSEEK_API_KEY 也不会影响 Bot 启动；
-- 当前版本每次请求都是独立对话，不携带任何聊天历史。
+  （即本次不选用 DeepSeek）时，缺少 DEEPSEEK_API_KEY 也不会影响 Bot 启动。
 """
 
 import os
@@ -25,9 +26,6 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 # 单次请求超时（秒），包含建立连接 + 等待回复。
 # DeepSeek 偶发响应较慢，60 秒比较稳妥；如觉得太久可改小。
 DEEPSEEK_TIMEOUT = 60.0
-
-# 系统提示词：让 AI 用中文清晰、准确地回答
-SYSTEM_PROMPT = "你是一个QQ群里的AI助手，请使用中文清晰、准确地回答用户问题。"
 
 # 模型名从环境变量读取，不散落在业务代码里；未配置时用默认值
 # DeepSeek 当前支持的模型名：deepseek-v4-flash / deepseek-v4-pro（deepseek-chat 为兼容别名）
@@ -54,17 +52,12 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
-async def ask_deepseek(question: str) -> str | None:
-    """向 DeepSeek 提问。
+async def ask_deepseek(messages: list[dict[str, str]]) -> str | None:
+    """把构造好的 messages 发给 DeepSeek。
 
     成功返回回答文本；任何失败（超时、网络错误、Key 错误、
     返回为空等）都返回 None，由调用方决定如何提示用户。
     """
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
-
     try:
         # 异步调用，不阻塞事件循环
         response = await _get_client().chat.completions.create(
