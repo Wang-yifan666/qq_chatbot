@@ -8,12 +8,15 @@
 5. 保存当前用户问题（role=user）；
 6. 读取该用户本群长期记忆（user_id + group_id 双重隔离）；
 7. 计算有效关系（close 为运行时派生状态，唯一来源 CLOSE_USER_ID）；
-8. 用「人格 + 可信状态（用户/关系/记忆）+ 旧 Context + 当前问题」只构造一次 messages；
-9. 主服务商失败时，用完全相同的 messages 降级到备用服务商；
-10. 成功后在 chat.finish() 之前：保存机器人回答（role=assistant）
+8. 从最近群聊提取参与者，构造 Relationship Context（亲近倾向，多人偏向）；
+9. Mini-RAG：检索本群个人资料（memory_retriever，失败降级为无记忆对话）；
+10. 用「人格 + 可信状态 + 亲近倾向 + Personal Memory + 旧 Context + 当前问题」
+    只构造一次 messages；
+11. 主服务商失败时，用完全相同的 messages 降级到备用服务商；
+12. 成功后在 chat.finish() 之前：保存机器人回答（role=assistant）
     —— finish 会结束当前 Handler，保存代码绝不能写在 finish 之后；
-11. 有效互动计数原子 +1（@ 且成功得到回答才计数；普通群聊不加关系进度）；
-12. 后台异步尝试长期记忆提取（不阻塞回复；失败只记日志）。
+13. 有效互动计数原子 +1（@ 且成功得到回答才计数；普通群聊不加关系进度）；
+14. 后台异步尝试长期记忆提取（不阻塞回复；失败只记日志）。
 
 群消息入库分工（与 plugins/context_recorder.py 配合）：
 - 普通非 @ 群消息 → context_recorder（priority=20）入库（同时 upsert 用户）；
@@ -30,11 +33,17 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.rule import to_me
 
 from services import redact_secrets
+from services.affection_store import collect_participant_ids
+from services.affection_store import get_relationship_context
 from services.context_store import CONTEXT_MESSAGE_LIMIT
 from services.context_store import add_message
 from services.context_store import get_recent_messages
 from services.deepseek import ask_deepseek
 from services.memory_extractor import extract_memories
+from services.memory_retriever import MEMORY_MAX_CHARS
+from services.memory_retriever import MEMORY_TOP_K
+from services.memory_retriever import format_memory_context
+from services.memory_retriever import retrieve_memories
 from services.memory_store import USER_MEMORY_LIMIT
 from services.memory_store import add_memory
 from services.memory_store import get_user_memories
@@ -160,23 +169,56 @@ async def _answer(event: GroupMessageEvent, question: str) -> str:
         #    数据库里永远只有 base_level
         relationship = await get_effective_relationship(user_id)
 
-        # 6. 只构造一次 messages；主备服务商共用，人格 / 身份 / 关系 / 记忆 / 上下文完全一致
+        # 6. Relationship Context：从最近群聊中提取参与者，
+        #    按亲近倾向（affection）排序后注入 Prompt（多人场景下的隐式人格偏置）。
+        #    数据库不可用时返回空块，降级为无偏向的普通对话。
+        participant_ids = collect_participant_ids(history, user_id)
+        relationship_context = await get_relationship_context(
+            group_id, participant_ids, user_id
+        )
+
+        # 7. Mini-RAG：检索本群个人资料（增强能力）。
+        #    记忆库故障时记录 [MEMORY] retrieve failed 并降级为无 Memory 的普通对话，
+        #    绝不让 Memory 数据库故障导致聊天功能整体不可用。
+        try:
+            retrieved = await retrieve_memories(group_id, user_id, question, MEMORY_TOP_K)
+            memory_context = format_memory_context(retrieved, MEMORY_MAX_CHARS) or None
+            if retrieved:
+                logger.info(
+                    "[RAG] group_id={} user_id={} query={} retrieved={}",
+                    group_id,
+                    user_id,
+                    question,
+                    len(retrieved),
+                )
+        except Exception as exc:
+            logger.error(
+                "[MEMORY] retrieve failed: {}: {}",
+                type(exc).__name__,
+                redact_secrets(str(exc)),
+            )
+            memory_context = None
+
+        # 8. 只构造一次 messages；主备服务商共用，
+        #    人格 / 身份 / 关系 / 亲近倾向 / 记忆 / Personal Memory / 上下文完全一致
         messages = build_messages(
             current_user=CurrentUser(user_id=user_id, display_name=nickname),
             relationship=relationship,
             memories=memories,
             history=history,
             question=question,
+            personal_memory_context=memory_context,
+            relationship_context=relationship_context,
         )
 
-        # 7. 主备调用（同一 messages）
+        # 9. 主备调用（同一 messages）
         answer, used_provider = await _ask_with_fallback(messages)
 
         if not answer:
             # 两个服务商都失败时，不把任何异常细节或 API Key 发到群里
             return "AI 服务暂时不可用，请稍后再试。"
 
-        # 8. chat.finish() 会结束当前 Handler，因此必须先把回答写入数据库再回复
+        # 10. chat.finish() 会结束当前 Handler，因此必须先把回答写入数据库再回复
         await add_message(
             group_id=group_id,
             user_id=event.self_id,
@@ -185,10 +227,10 @@ async def _answer(event: GroupMessageEvent, question: str) -> str:
             content=answer,
         )
 
-        # 9. 有效互动计数原子 +1，并按阈值重算 base_level（close 用户同样计数）
+        # 11. 有效互动计数原子 +1，并按阈值重算 base_level（close 用户同样计数）
         await record_direct_interaction(user_id)
 
-        # 10. 后台异步提取长期记忆（不阻塞回复；失败只记日志，绝不影响主回答）
+        # 12. 后台异步提取长期记忆（不阻塞回复；失败只记日志，绝不影响主回答）
         if len(question) >= _MEMORY_EXTRACT_MIN_LEN:
             asyncio.create_task(
                 _extract_memories_in_background(user_id, group_id, nickname, question)

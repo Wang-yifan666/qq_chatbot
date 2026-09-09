@@ -28,6 +28,9 @@ from services import redact_secrets
 from services.database import DB_PATH
 from services.database import close_db
 from services.database import init_db
+from services.personal_memory_store import DB_PATH as MEMORY_DB_PATH
+from services.personal_memory_store import close_memory_db
+from services.personal_memory_store import init_memory_db
 
 # 1. 把 .env 中的配置加载到环境变量。
 #    必须在读取任何配置之前执行，这样 NoneBot2 和 DeepSeek 客户端都能读到配置。
@@ -135,6 +138,26 @@ async def _init_chat_history_db() -> None:
 async def _close_chat_history_db() -> None:
     """进程退出前关闭数据库连接。"""
     await close_db()
+    await close_memory_db()
+
+
+@driver.on_startup
+async def _init_memory_db() -> None:
+    """启动时初始化 Personal Memory 库（data/qq_ai_bot.db）。
+
+    失败只记录清晰 ERROR 日志：\\debug 命令与 Mini-RAG 暂不可用，
+    普通聊天完全不受影响（ai_chat 的检索步骤会自动降级为无记忆对话）。
+    """
+    try:
+        await init_memory_db()
+        logger.info("[MEMORY] Personal Memory 数据库已就绪：{}", MEMORY_DB_PATH)
+    except Exception as exc:
+        logger.error(
+            "[MEMORY] Personal Memory 数据库初始化失败"
+            "（调试命令与 Mini-RAG 暂不可用，普通聊天不受影响）：{}: {}",
+            type(exc).__name__,
+            redact_secrets(str(exc)),
+        )
 
 
 if __name__ == "__main__":
