@@ -20,6 +20,7 @@ from nonebot import logger
 from openai import AsyncOpenAI
 
 from services import redact_secrets
+from services.tool_orchestrator import RawCompletion
 
 # 智谱开放平台 OpenAI 兼容接口地址（文档：https://open.bigmodel.cn）
 GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
@@ -27,8 +28,8 @@ GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 # 单次请求超时（秒），包含建立连接 + 等待回复
 GLM_TIMEOUT = 60.0
 
-# 模型名从环境变量读取，未配置时用默认值 glm-4.7-flash
-model = os.getenv("ZHIPU_MODEL") or "glm-4.7-flash"
+# 默认模型名从环境变量读取，未配置时用默认值 glm-4.7-flash
+DEFAULT_MODEL = os.getenv("ZHIPU_MODEL") or "glm-4.7-flash"
 
 _client: AsyncOpenAI | None = None
 
@@ -50,29 +51,45 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
-async def ask_glm(messages: list[dict[str, str]]) -> str | None:
-    """把构造好的 messages 发给智谱 GLM。
+async def call_glm(
+    messages: list[dict[str, str]],
+    model: str | None = None,
+    tools: list[dict] | None = None,
+) -> RawCompletion | None:
+    """原始调用：返回内容 + 可能的 tool_calls（供 Tool Orchestrator 使用）。
 
-    成功返回回答文本；任何失败（超时、网络错误、Key 错误、
-    返回为空等）都返回 None，由调用方决定如何提示用户。
+    tools 为 OpenAI 兼容工具定义列表；None 表示不启用工具。
+    任何失败返回 None（异常只记日志，Bot 不崩溃）。
     """
+    selected_model = model or DEFAULT_MODEL
     try:
-        # 异步调用，不阻塞事件循环
+        kwargs: dict = {}
+        if tools:
+            kwargs["tools"] = tools
         response = await _get_client().chat.completions.create(
-            model=model,
+            model=selected_model,
             messages=messages,
+            **kwargs,
         )
 
         if not response.choices:
             logger.warning("[AI CHAT] GLM 返回为空（没有 choices）")
             return None
 
-        answer = response.choices[0].message.content
-        if not answer or not answer.strip():
+        message = response.choices[0].message
+        content = (message.content or "").strip() or None
+        tool_calls = [
+            {
+                "id": call.id,
+                "name": call.function.name,
+                "arguments": call.function.arguments or "{}",
+            }
+            for call in (message.tool_calls or [])
+        ]
+        if not content and not tool_calls:
             logger.warning("[AI CHAT] GLM 返回内容为空")
             return None
-
-        return answer.strip()
+        return RawCompletion(content=content, tool_calls=tool_calls)
 
     except Exception as exc:  # 兜底捕获所有异常，保证 Bot 进程不崩溃
         # 只记录异常类型和简要说明；先经 redact_secrets 清洗，绝不把 API Key 带进日志
@@ -82,3 +99,16 @@ async def ask_glm(messages: list[dict[str, str]]) -> str | None:
             redact_secrets(str(exc)),
         )
         return None
+
+
+async def ask_glm(
+    messages: list[dict[str, str]],
+    model: str | None = None,
+) -> str | None:
+    """把构造好的 messages 发给智谱 GLM（无工具路径，兼容旧调用）。
+
+    model：本次调用使用的模型名；None 时使用默认模型（ZHIPU_MODEL，
+    未配置则 glm-4.7-flash）。同服务商双模型降级时由调用方传入。
+    """
+    raw = await call_glm(messages, model=model)
+    return raw.content if raw else None

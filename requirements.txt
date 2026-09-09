@@ -23,3 +23,15 @@ aiosqlite>=0.19.0
 # ===== Environment variables =====
 # Loads the .env file into environment variables
 python-dotenv>=1.0.0
+
+# ===== Timezone database (Windows) =====
+# Python on Windows has no built-in IANA tz database; zoneinfo needs this package
+# for BOT_TIMEZONE (runtime date/time state).
+tzdata>=2024.1
+
+# ===== Persona RAG（本地向量检索，v0.1 无向量数据库） =====
+# NumPy 本地索引 + sentence-transformers CPU 推理（会拉取 torch 依赖）。
+# 首次运行 build 脚本时需要联网下载 embedding 模型（默认 BAAI/bge-small-zh-v1.5，
+# 约 100MB；网络受限可设 HF_ENDPOINT=https://hf-mirror.com）。
+numpy>=1.26,<3
+sentence-transformers>=2.6,<4

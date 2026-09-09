@@ -1,4 +1,4 @@
-"""AI 聊天插件（v0.2.2）：群里 @机器人 → 用户状态 + 短期上下文 + 人格 → AI 模型 → 群回复。
+"""AI 聊天插件（v0.3.0）：群里 @机器人 → 用户状态 + 短期上下文 + 人格 → AI 模型 → 群回复。
 
 处理顺序（同一群内的 @ 处理通过 per-group asyncio.Lock 串行）：
 1. 只处理 QQ 群消息（GroupMessageEvent），只有 @机器人 才触发（to_me 规则）；
@@ -10,13 +10,15 @@
 7. 计算有效关系（close 为运行时派生状态，唯一来源 CLOSE_USER_ID）；
 8. 从最近群聊提取参与者，构造 Relationship Context（亲近倾向，多人偏向）；
 9. Mini-RAG：检索本群个人资料（memory_retriever，失败降级为无记忆对话）；
-10. 用「人格 + 可信状态 + 亲近倾向 + Personal Memory + 旧 Context + 当前问题」
+10. Persona RAG：检索夜子人格语料参考（本地 NumPy 索引，to_thread 执行，
+    失败降级为无参考，绝不影响主链路）；
+11. 用「人格 + 可信状态 + 亲近倾向 + Personal Memory + Persona RAG + 旧 Context + 当前问题」
     只构造一次 messages；
-11. 主服务商失败时，用完全相同的 messages 降级到备用服务商；
-12. 成功后在 chat.finish() 之前：保存机器人回答（role=assistant）
+12. 主服务商失败时，用完全相同的 messages 降级到备用服务商；
+13. 成功后在 chat.finish() 之前：保存机器人回答（role=assistant）
     —— finish 会结束当前 Handler，保存代码绝不能写在 finish 之后；
-13. 有效互动计数原子 +1（@ 且成功得到回答才计数；普通群聊不加关系进度）；
-14. 后台异步尝试长期记忆提取（不阻塞回复；失败只记日志）。
+14. 有效互动计数原子 +1（@ 且成功得到回答才计数；普通群聊不加关系进度）；
+15. 后台异步尝试长期记忆提取（不阻塞回复；失败只记日志）。
 
 群消息入库分工（与 plugins/context_recorder.py 配合）：
 - 普通非 @ 群消息 → context_recorder（priority=20）入库（同时 upsert 用户）；
@@ -33,12 +35,14 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.rule import to_me
 
 from services import redact_secrets
+from services import persona_rag
 from services.affection_store import collect_participant_ids
 from services.affection_store import get_relationship_context
 from services.context_store import CONTEXT_MESSAGE_LIMIT
 from services.context_store import add_message
 from services.context_store import get_recent_messages
 from services.deepseek import ask_deepseek
+from services.deepseek import call_deepseek
 from services.memory_extractor import extract_memories
 from services.memory_retriever import MEMORY_MAX_CHARS
 from services.memory_retriever import MEMORY_TOP_K
@@ -53,8 +57,15 @@ from services.prompt_builder import build_messages
 from services.prompt_builder import sender_display_name
 from services.relationship_service import get_effective_relationship
 from services.relationship_service import record_direct_interaction
+from services.reply_splitter import SPLIT_REPLY_DELAY_MS
+from services.reply_splitter import SPLIT_REPLY_ENABLED
+from services.reply_splitter import split_reply
+from services.tool_orchestrator import WEB_SEARCH_TOOL_SCHEMA
+from services.tool_orchestrator import run_with_tools
 from services.user_store import upsert_user
+from services.web_search import WEB_SEARCH_ENABLED
 from services.zhipu import ask_glm
+from services.zhipu import call_glm
 
 # 服务商名 → 对应的调用函数（两家都是 OpenAI 兼容接口，返回格式一致）
 PROVIDER_HANDLERS = {
@@ -62,14 +73,31 @@ PROVIDER_HANDLERS = {
     "zhipu": ask_glm,
 }
 
-# 主服务商与备用服务商（在 .env 中配置，修改后需重启生效）
+# 服务商名 → 原始调用（返回 content + tool_calls，供 Tool Orchestrator 使用）
+PROVIDER_RAW_HANDLERS = {
+    "deepseek": call_deepseek,
+    "zhipu": call_glm,
+}
+
+# 主服务商与备用服务商（在 .env 中配置，修改后需重启生效）。
+# 支持两种降级：
+# - 跨服务商：AI_PROVIDER=deepseek + AI_FALLBACK=zhipu（或反之）；
+# - 同服务商双模型：AI_PROVIDER=AI_FALLBACK=deepseek，
+#   主模型 = AI_MODEL（或 DEEPSEEK_MODEL 默认），备用模型 = AI_FALLBACK_MODEL。
 AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek").strip().lower()
 AI_FALLBACK = (os.getenv("AI_FALLBACK", "") or "").strip().lower() or None
+# 主模型覆盖（留空 = 用服务商默认模型 DEEPSEEK_MODEL / ZHIPU_MODEL）
+AI_MODEL = (os.getenv("AI_MODEL", "") or "").strip() or None
+# 备用模型覆盖（留空 = 用备用服务商默认模型；同服务商降级时必填）
+AI_FALLBACK_MODEL = (os.getenv("AI_FALLBACK_MODEL", "") or "").strip() or None
 
 # 记忆提取的最小问题长度（太短的寒暄不值得多花一次 LLM 调用）
 _MEMORY_EXTRACT_MIN_LEN = 6
 # 记忆提取单次调用超时（秒），超时放弃，不影响回复
 _MEMORY_EXTRACT_TIMEOUT = 20.0
+
+# 本进程的可用工具（由程序根据 WEB_SEARCH_ENABLED 决定，聊天内容不能修改）
+TOOLS = [WEB_SEARCH_TOOL_SCHEMA] if WEB_SEARCH_ENABLED else None
 
 # 消息事件匹配器：
 # - rule=to_me()：只有 @机器人（或回复机器人）的消息才进入本处理器
@@ -92,25 +120,63 @@ def _get_group_lock(group_id: int) -> asyncio.Lock:
     return lock
 
 
-async def _ask(provider: str, messages: list[dict[str, str]]) -> str | None:
-    """按服务商名调用对应的 AI 服务，成功返回回答文本，失败返回 None。"""
-    return await PROVIDER_HANDLERS[provider](messages)
+async def _ask(
+    provider: str,
+    messages: list[dict[str, str]],
+    model: str | None = None,
+) -> str | None:
+    """按服务商名调用对应的 AI 服务；model=None 时使用服务商默认模型。"""
+    return await PROVIDER_HANDLERS[provider](messages, model)
+
+
+async def _ask_raw(
+    provider: str,
+    messages: list[dict],
+    model: str | None = None,
+    tools: list[dict] | None = None,
+):
+    """按服务商名调用原始接口（返回 RawCompletion | None，供工具编排使用）。"""
+    return await PROVIDER_RAW_HANDLERS[provider](messages, model, tools)
 
 
 async def _ask_with_fallback(
     messages: list[dict[str, str]],
+    tools: list[dict] | None = None,
 ) -> tuple[str | None, str]:
-    """主 Provider → 失败用完全相同的 messages 降级备用；返回 (answer, 实际 provider)。"""
+    """主 Provider（主模型）→ 失败用完全相同的 messages 降级备用（备用模型）。
+
+    返回 (answer, 实际使用的 provider)。同服务商双模型降级时，
+    主备都指向同一 provider，但分别使用 AI_MODEL 与 AI_FALLBACK_MODEL。
+    tools 不为 None 时启用工具编排（主备各自独立编排，工具输出不可信 DATA）。
+    """
     used_provider = AI_PROVIDER
-    answer = await _ask(AI_PROVIDER, messages)
+    if tools:
+        answer = await run_with_tools(
+            lambda msgs, t=None: _ask_raw(AI_PROVIDER, msgs, AI_MODEL, t),
+            messages,
+            tools,
+        )
+    else:
+        answer = await _ask(AI_PROVIDER, messages, AI_MODEL)
+
     if not answer and AI_FALLBACK:
         logger.warning(
-            "[AI CHAT] 主服务商 {} 调用失败，降级到 {} 重试",
+            "[AI CHAT] 主服务商 {} 调用失败，降级到 {} 重试"
+            "（主模型 {}，备用模型 {}）",
             AI_PROVIDER,
             AI_FALLBACK,
+            AI_MODEL or "默认",
+            AI_FALLBACK_MODEL or "默认",
         )
         used_provider = AI_FALLBACK
-        answer = await _ask(AI_FALLBACK, messages)
+        if tools:
+            answer = await run_with_tools(
+                lambda msgs, t=None: _ask_raw(AI_FALLBACK, msgs, AI_FALLBACK_MODEL, t),
+                messages,
+                tools,
+            )
+        else:
+            answer = await _ask(AI_FALLBACK, messages, AI_FALLBACK_MODEL)
     return answer, used_provider
 
 
@@ -133,7 +199,18 @@ async def handle(event: GroupMessageEvent):
         await chat.finish("有什么想问我的？")
 
     answer = await _answer(event, question)
-    await chat.finish(answer)
+
+    # 多自然段拆成多条 QQ 消息（防刷屏）：前 N-1 条用 send，最后一条用 finish。
+    # 注意：SQLite 里的 assistant 回答始终只保存完整原始 answer 一次（在 _answer 内）。
+    if SPLIT_REPLY_ENABLED:
+        parts = split_reply(answer)
+        for part in parts[:-1]:
+            await chat.send(part)
+            if SPLIT_REPLY_DELAY_MS > 0:
+                await asyncio.sleep(SPLIT_REPLY_DELAY_MS / 1000)
+        await chat.finish(parts[-1])
+    else:
+        await chat.finish(answer)
 
 
 async def _answer(event: GroupMessageEvent, question: str) -> str:
@@ -199,8 +276,35 @@ async def _answer(event: GroupMessageEvent, question: str) -> str:
             )
             memory_context = None
 
+        # 7.5 Persona RAG：检索夜子人格语料参考（风格参考，不是记忆/事实）。
+        #      embedding 推理是同步 CPU 计算，用 to_thread 避免阻塞事件循环；
+        #      任何失败（模型缺失 / 索引缺失 / 维度不匹配等）都降级为无参考，
+        #      绝不让 Persona RAG 故障使 Bot 掉线。
+        persona_refs = []
+        if persona_rag.PERSONA_RAG_ENABLED:
+            try:
+                persona_refs = await asyncio.to_thread(
+                    persona_rag.retrieve, question, relationship, history
+                )
+                if persona_refs:
+                    logger.info(
+                        "[PERSONA RAG] group_id={} user_id={} relationship={} refs={}",
+                        group_id,
+                        user_id,
+                        relationship,
+                        len(persona_refs),
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "[PERSONA RAG] retrieval failed（降级为无参考，Bot 正常回答）：{}: {}",
+                    type(exc).__name__,
+                    redact_secrets(str(exc)),
+                )
+                persona_refs = []
+
         # 8. 只构造一次 messages；主备服务商共用，
-        #    人格 / 身份 / 关系 / 亲近倾向 / 记忆 / Personal Memory / 上下文完全一致
+        #    人格 / 身份 / 关系 / 亲近倾向 / 记忆 / Personal Memory / Persona RAG /
+        #    上下文完全一致
         messages = build_messages(
             current_user=CurrentUser(user_id=user_id, display_name=nickname),
             relationship=relationship,
@@ -209,10 +313,11 @@ async def _answer(event: GroupMessageEvent, question: str) -> str:
             question=question,
             personal_memory_context=memory_context,
             relationship_context=relationship_context,
+            persona_refs=persona_refs,
         )
 
         # 9. 主备调用（同一 messages）
-        answer, used_provider = await _ask_with_fallback(messages)
+        answer, used_provider = await _ask_with_fallback(messages, TOOLS)
 
         if not answer:
             # 两个服务商都失败时，不把任何异常细节或 API Key 发到群里

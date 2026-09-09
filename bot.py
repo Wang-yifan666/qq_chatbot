@@ -13,6 +13,7 @@
 
 import os
 import sys
+import threading
 
 if sys.platform == "win32":
     # 中文 Windows 的控制台默认按 GBK 解码输出，强制使用 UTF-8，避免中文日志乱码
@@ -51,7 +52,24 @@ driver.register_adapter(OneBotV11Adapter)
 #    而不是等到群里来消息时才报出难以理解的错误。
 #    主服务商由 .env 的 AI_PROVIDER 决定（deepseek | zhipu）；
 #    AI_FALLBACK 为可选备用服务商（调用失败时自动降级），留空表示不降级。
+#    支持两种降级：跨服务商（如 deepseek→zhipu），
+#    以及同服务商双模型（如 deepseek 主模型→deepseek 备用模型，
+#    需配置 AI_FALLBACK_MODEL 且与主模型不同）。
 VALID_PROVIDERS = ("deepseek", "zhipu")
+
+# 各服务商默认模型（与 services/deepseek.py / zhipu.py 保持一致，仅用于启动校验）
+_PROVIDER_DEFAULT_MODELS = {"deepseek": "deepseek-v4-flash", "zhipu": "glm-4.7-flash"}
+
+
+def _effective_primary_model(provider: str) -> str:
+    """主模型：AI_MODEL 优先，否则服务商默认模型。"""
+    generic = (os.getenv("AI_MODEL") or "").strip()
+    if generic:
+        return generic
+    if provider == "deepseek":
+        return os.getenv("DEEPSEEK_MODEL") or _PROVIDER_DEFAULT_MODELS["deepseek"]
+    return os.getenv("ZHIPU_MODEL") or _PROVIDER_DEFAULT_MODELS["zhipu"]
+
 
 AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek").strip().lower()
 if AI_PROVIDER not in VALID_PROVIDERS:
@@ -70,11 +88,24 @@ if AI_FALLBACK:
         )
         sys.exit(1)
     if AI_FALLBACK == AI_PROVIDER:
-        logger.error(
-            "[AI CHAT] AI_FALLBACK 不能与 AI_PROVIDER 相同（都是 {}），请检查 .env 配置。",
-            AI_FALLBACK,
-        )
-        sys.exit(1)
+        # 同服务商降级：必须配置备用模型，且与主模型不同
+        fallback_model = (os.getenv("AI_FALLBACK_MODEL") or "").strip()
+        primary_model = _effective_primary_model(AI_PROVIDER)
+        if not fallback_model:
+            logger.error(
+                "[AI CHAT] AI_FALLBACK 与 AI_PROVIDER 相同（都是 {}）时属于同服务商双模型降级，"
+                "必须在 .env 中配置 AI_FALLBACK_MODEL（备用模型名）。",
+                AI_FALLBACK,
+            )
+            sys.exit(1)
+        if fallback_model == primary_model:
+            logger.error(
+                "[AI CHAT] AI_FALLBACK_MODEL={} 与主模型 {} 相同，"
+                "同服务商降级需要两个不同的模型。",
+                fallback_model,
+                primary_model,
+            )
+            sys.exit(1)
 
 # 依次检查用到的每个服务商是否配置了 API Key
 for provider in [AI_PROVIDER] + ([AI_FALLBACK] if AI_FALLBACK else []):
@@ -158,6 +189,23 @@ async def _init_memory_db() -> None:
             type(exc).__name__,
             redact_secrets(str(exc)),
         )
+
+
+@driver.on_startup
+async def _warmup_persona_rag() -> None:
+    """启动时后台预热 Persona RAG（加载 embedding 模型 + 本地索引）。
+
+    embedding 模型首次加载需要数秒：提前在后台线程预热，第一条 @ 消息
+    就不会被模型加载阻塞。失败只记 ERROR 日志：Persona RAG 自动禁用，
+    普通聊天完全不受影响。模型只加载一次，运行中不会重复加载。
+    """
+
+    def _warm() -> None:
+        from services.persona_rag import warmup
+
+        warmup()
+
+    threading.Thread(target=_warm, daemon=True, name="persona-rag-warmup").start()
 
 
 if __name__ == "__main__":

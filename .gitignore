@@ -26,3 +26,8 @@ data/*.db*
 
 # ===== 本地人格覆盖文件（可选，禁止提交本机自定义人格） =====
 persona.txt
+
+# ===== Persona 语料与机器生成索引（版权数据，禁止提交原作台词） =====
+# 只保留 schema 文档 / 自造 example（docs/）与 RAG 代码 / build 脚本
+data/persona_processed/
+data/persona_rag/
