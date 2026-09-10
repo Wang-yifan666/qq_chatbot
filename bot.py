@@ -21,8 +21,19 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-import nonebot
+# 1. 把 .env 中的配置加载到环境变量（bootstrap 顺序约束）。
+#    必须放在任何依赖环境变量的模块 import 之前：services.database 的
+#    DB_PATH（CHAT_HISTORY_DB）与 services.personal_memory_store 的
+#    DB_PATH（MEMORY_DB_PATH）都在模块导入阶段通过 os.getenv() 计算，
+#    plugins/ 下各插件与大部分 services 模块同样在导入期读取配置。
+#    因此 load_dotenv() 必须先于全部业务模块 import 执行，否则 .env
+#    中的覆盖值不会生效；也不要把它散落到各模块里重复调用。
 from dotenv import load_dotenv
+
+load_dotenv()
+
+# 2. 以下是业务 import：全部发生在 load_dotenv() 之后。
+import nonebot
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 
@@ -34,22 +45,18 @@ from services.personal_memory_store import DB_PATH as MEMORY_DB_PATH
 from services.personal_memory_store import close_memory_db
 from services.personal_memory_store import init_memory_db
 
-# 1. 把 .env 中的配置加载到环境变量。
-#    必须在读取任何配置之前执行，这样 NoneBot2 和 DeepSeek 客户端都能读到配置。
-load_dotenv()
-
-# 2. 初始化 NoneBot2。
+# 3. 初始化 NoneBot2。
 #    会自动读取 .env 中的 DRIVER / HOST / PORT / ONEBOT_ACCESS_TOKEN 等配置。
 nonebot.init()
 
 driver = nonebot.get_driver()
 
-# 3. 注册 OneBot V11 适配器。
+# 4. 注册 OneBot V11 适配器。
 #    注册后 NoneBot2 会监听 ws://127.0.0.1:8080/onebot/v11/ws，
 #    等待 NapCat 主动连接（反向 WebSocket）。
 driver.register_adapter(OneBotV11Adapter)
 
-# 4. 启动前检查关键配置：缺少所选 AI 服务商的 API Key 时给出明确提示并退出，
+# 5. 启动前检查关键配置：缺少所选 AI 服务商的 API Key 时给出明确提示并退出，
 #    而不是等到群里来消息时才报出难以理解的错误。
 #    主服务商由 .env 的 AI_PROVIDER 决定（deepseek | zhipu）；
 #    AI_FALLBACK 为可选备用服务商（调用失败时自动降级），留空表示不降级。
@@ -122,7 +129,7 @@ for provider in [AI_PROVIDER] + ([AI_FALLBACK] if AI_FALLBACK else []):
         )
         sys.exit(1)
 
-# 5. close 用户配置校验（必须在 load_dotenv 之后执行）：
+# 6. close 用户配置校验（必须在 load_dotenv 之后执行）：
 #    CLOSE_USER_ID 是 close 关系的唯一真相来源；空 = 没有 close 用户；
 #    非法值（非数字）在启动阶段直接报错退出，而不是运行到聊天时才暴露。
 #    注意：日志中绝不输出真实 CLOSE_USER_ID。
@@ -140,7 +147,7 @@ if CLOSE_USER_ID is not None:
 else:
     logger.info("[RELATIONSHIP] 未配置 close 用户（CLOSE_USER_ID 为空）")
 
-# 5.5 群聊访问白名单校验（fail-closed）：
+# 6.5 群聊访问白名单校验（fail-closed）：
 #     解析与合法性检查集中在 services/group_access.py；非法配置（如 111,abc）
 #     在启动阶段报 ERROR 并退出，而不是等第一条群消息才暴露。
 #     日志只输出群数量，不打印真实 QQ 群号。
@@ -161,11 +168,11 @@ elif not ALLOWED_GROUP_IDS:
 else:
     logger.info("[GROUP ACCESS] allowed groups configured: {}", len(ALLOWED_GROUP_IDS))
 
-# 6. 加载 plugins/ 目录下的全部插件（ai_chat / context_recorder）。
+# 7. 加载 plugins/ 目录下的全部插件（ai_chat / context_recorder）。
 nonebot.load_plugins("plugins")
 
 
-# 7. 数据库生命周期钩子（NoneBot2 2.5.0 提供 driver.on_startup / on_shutdown，
+# 8. 数据库生命周期钩子（NoneBot2 2.5.0 提供 driver.on_startup / on_shutdown，
 #    见 nonebot/internal/driver/_lifespan.py；API 已对照本仓库安装版本确认）。
 @driver.on_startup
 async def _init_chat_history_db() -> None:

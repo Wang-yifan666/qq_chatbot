@@ -1,4 +1,4 @@
-"""Debug 管理插件（v0.2.5）：以反斜杠 \\debug 开头的管理员调试命令。
+r"""Debug 管理插件（v0.2.5）：以反斜杠 \debug 开头的管理员调试命令。
 
 安全边界：
 - 只处理群消息（GroupMessageEvent），暂不处理私聊；
@@ -11,8 +11,8 @@
 - 不提供 shell / eval / 任意 SQL 执行，不是远程命令后门。
 
 匹配器：
-- rule=startswith("\\debug")：纯文本以 \\debug 开头即触发，不需要 @机器人；
-- priority=1（高于 ai_chat 的 10）、block=True：\\debug 消息不会再被当成
+- rule=startswith("\debug")：纯文本以 \debug 开头即触发，不需要 @机器人；
+- priority=1（高于 ai_chat 的 10）、block=True：\debug 消息不会再被当成
   普通 AI 问题，也不会进入 context_recorder 的群聊记录（避免把管理员设置的
   个人资料泄漏进群聊上下文）。
 """
@@ -97,7 +97,12 @@ async def _debug_rule(event: GroupMessageEvent) -> bool:
 
     - 纯文本以 \\debug 开头（有无 @机器人 均可，get_plaintext 会自动去掉 @）；
     - 或：@机器人 且第一个词是 debug 子命令（管理员专用便捷形式）。
+
+    群访问白名单检查放在读取正文之前：未授权群的命令文本根本不会被读取，
+    规则直接返回 False（处理器不运行，自然也不会回复 / 读写数据库）。
     """
+    if not is_group_allowed(event.group_id):
+        return False
     if event.get_plaintext().strip().startswith("\\debug"):
         return True
     return await _at_bare_debug_rule(event)
@@ -112,19 +117,63 @@ debug = on_message(rule=Rule(_debug_rule), priority=1, block=True)
 async def handle(event: GroupMessageEvent):
     # 0. 群访问白名单（fail-closed）：未授权群直接丢弃，
     #    不读取命令内容、不回复、不读写任何数据库。
+    #    匹配规则层已先做了一次检查（未授权群连命令正文都不会被读取），
+    #    这里保留防御性二次检查。
     if not is_group_allowed(event.group_id):
         return
 
     text = event.get_plaintext().strip()
     nickname = sender_display_name(event)
     reply = await _execute_debug_command(text, event.user_id, event.group_id, nickname)
+    # 隐私日志：只记录解析后的命令结构（cmd / subcmd / target_user_id / key），
+    # 绝不记录完整命令文本（\\debug memory set 的 value 可能含私人资料）。
     logger.info(
-        "[DEBUG] cmd={} user_id={} group_id={}",
-        text,
+        "[DEBUG] user_id={} group_id={} {}",
         event.user_id,
         event.group_id,
+        _debug_log_fields(text),
     )
     await debug.finish(reply)
+
+
+# 日志中允许记录的 debug 子命令（这些子命令没有隐私敏感的 value）
+_DEBUG_LOG_SUBCOMMANDS = ("set", "list", "del", "clear", "get")
+
+
+def _debug_log_fields(text: str) -> str:
+    """把一条 debug 命令解析成可安全写日志的字段串（绝不包含 value）。
+
+    \\debug memory set <qq> <key> <value...> 只输出 target_user_id 与 key；
+    value、rag query、未知命令的参数一律不进入日志。字段值先做空白折叠与截断，
+    防止 token 本身携带超长内容。
+    """
+    parts = (text or "").split()
+    if parts and parts[0] == "\\debug":
+        parts = parts[1:]
+    if not parts:
+        return "cmd="
+
+    fields: list[str] = [f"cmd={_log_token(parts[0])}"]
+    cmd = parts[0]
+    if len(parts) >= 2 and cmd in ("memory", "affection") and parts[1] in _DEBUG_LOG_SUBCOMMANDS:
+        fields.append(f"subcmd={_log_token(parts[1])}")
+        # memory set/list/del/clear 与 affection set/get 的第二参数都是目标 QQ 号
+        if len(parts) >= 3:
+            target = _parse_qq(parts[2])
+            if target is not None:
+                fields.append(f"target_user_id={target}")
+        # memory set <qq> <key> <value...>：key 可记（键名），value 绝不记录
+        if cmd == "memory" and parts[1] == "set" and len(parts) >= 4:
+            fields.append(f"key={_log_token(parts[3])}")
+    return " ".join(fields)
+
+
+def _log_token(token: str, max_chars: int = 32) -> str:
+    """日志用 token：折叠空白并截断，避免异常超长参数进入日志。"""
+    cleaned = " ".join((token or "").split())
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars] + "…"
+    return cleaned
 
 
 def _help_text() -> str:
@@ -394,6 +443,7 @@ __all__ = [
     "handle",
     "DEBUG_ADMINS",
     "_execute_debug_command",
+    "_debug_log_fields",
     "_memory_command",
     "_rag_command",
     "_affection_command",

@@ -1,0 +1,6 @@
+# ===== Dev / test dependencies (v0.3.1, keep minimal) =====
+# Install with:  pip install -r requirements-dev.txt
+# Run tests with: pytest -q  (see README "Testing" section)
+# Mocking uses Python stdlib unittest.mock; no lint/coverage tools here on purpose.
+pytest>=8.0
+pytest-asyncio>=0.23

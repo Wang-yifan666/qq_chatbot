@@ -24,6 +24,8 @@ from nonebot import logger
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
+from services import log_message_content_enabled
+from services import safe_log_text
 from services.context_store import add_message
 from services.group_access import is_group_allowed
 from services.prompt_builder import sender_display_name
@@ -53,12 +55,23 @@ async def handle(event: GroupMessageEvent):
     if not content:
         return
 
-    logger.debug(
-        "[CONTEXT] 记录群消息 group_id={} user_id={} content={}",
-        event.group_id,
-        event.user_id,
-        content,
-    )
+    # 隐私日志：默认只记长度；LOG_MESSAGE_CONTENT=true 时才记录正文
+    # （仍经过 redact_secrets 清洗 + 截断）。
+    if log_message_content_enabled():
+        logger.debug(
+            "[CONTEXT] 记录群消息 group_id={} user_id={} content_chars={} content={}",
+            event.group_id,
+            event.user_id,
+            len(content),
+            safe_log_text(content),
+        )
+    else:
+        logger.debug(
+            "[CONTEXT] 记录群消息 group_id={} user_id={} content_chars={}",
+            event.group_id,
+            event.user_id,
+            len(content),
+        )
 
     # 顺带记录用户身份（user_id 稳定身份 + 最近显示名）；
     # 失败只记 ERROR（user_store 内部处理），不影响消息入库

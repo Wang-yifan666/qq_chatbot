@@ -24,7 +24,9 @@ import httpx
 
 from nonebot import logger
 
+from services import log_message_content_enabled
 from services import redact_secrets
+from services import safe_log_text
 
 WEB_SEARCH_TIMEOUT_DEFAULT = 15.0
 WEB_SEARCH_TIMEOUT_MIN = 3.0
@@ -90,6 +92,26 @@ else:
     logger.info("[WEB SEARCH] disabled")
 
 
+def _log_search_done(backend: str, query: str, result_count: int) -> None:
+    """搜索完成日志：默认只记 query 长度（搜索 query 可能含敏感信息）；
+    LOG_MESSAGE_CONTENT=true 时才记录清洗 + 截断后的 query。"""
+    if log_message_content_enabled():
+        logger.info(
+            "[WEB SEARCH] backend={} query_chars={} query={} results={}",
+            backend,
+            len(query),
+            safe_log_text(query, 80),
+            result_count,
+        )
+    else:
+        logger.info(
+            "[WEB SEARCH] backend={} query_chars={} results={}",
+            backend,
+            len(query),
+            result_count,
+        )
+
+
 async def search(query: str) -> list[dict[str, str]]:
     """执行联网搜索，返回 [{title, url, snippet}]。
 
@@ -146,7 +168,7 @@ async def _search_bing(query: str) -> list[dict[str, str]]:
         )
         if len(results) >= WEB_SEARCH_MAX_RESULTS:
             break
-    logger.info("[WEB SEARCH] backend=bing query={} results={}", redact_secrets(query)[:80], len(results))
+    _log_search_done("bing", query, len(results))
     return results
 
 
@@ -192,5 +214,5 @@ async def _search_duckduckgo(query: str) -> list[dict[str, str]]:
         results.append(item)
         if len(results) >= WEB_SEARCH_MAX_RESULTS:
             break
-    logger.info("[WEB SEARCH] query={} results={}", redact_secrets(query)[:80], len(results))
+    _log_search_done("duckduckgo", query, len(results))
     return results

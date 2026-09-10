@@ -141,7 +141,8 @@ async def _execute_tool_calls(tool_calls: list[dict], already_executed: int) -> 
             continue
 
         if call["name"] not in ALLOWED_TOOLS:
-            logger.warning("[TOOL] 拒绝未知工具：{}", call["name"])
+            # 工具名由模型输出，属不可信文本：日志只记截断后的名字
+            logger.warning("[TOOL] 拒绝未知工具：{}", str(call["name"])[:40])
             results.append(
                 {
                     "role": "tool",

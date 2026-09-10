@@ -39,7 +39,9 @@ from nonebot import on_message
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.rule import to_me
 
+from services import log_message_content_enabled
 from services import redact_secrets
+from services import safe_log_text
 from services import persona_rag
 from services.affection_store import collect_participant_ids
 from services.affection_store import get_relationship_context
@@ -205,14 +207,24 @@ async def handle(event: GroupMessageEvent):
     # get_plaintext() 只保留纯文本，自动去掉 @ 本体和所有 CQ Code。
     question = event.get_plaintext().strip()
 
-    # 收到 @ 消息的基础日志（严禁打印 API Key）
-    logger.info(
-        "[AI CHAT] provider={} group_id={} user_id={} question={}",
-        AI_PROVIDER,
-        event.group_id,
-        event.user_id,
-        question,
-    )
+    # 收到 @ 消息的基础日志（隐私：默认只记长度，绝不默认打印问题正文；严禁打印 API Key）
+    if log_message_content_enabled():
+        logger.info(
+            "[AI CHAT] provider={} group_id={} user_id={} question_chars={} question={}",
+            AI_PROVIDER,
+            event.group_id,
+            event.user_id,
+            len(question),
+            safe_log_text(question),
+        )
+    else:
+        logger.info(
+            "[AI CHAT] provider={} group_id={} user_id={} question_chars={}",
+            AI_PROVIDER,
+            event.group_id,
+            event.user_id,
+            len(question),
+        )
 
     # 只 @ 了机器人、后面没有问题：保持 v0.1 行为，直接提示，不调用 API
     if not question:
@@ -281,13 +293,23 @@ async def _answer(event: GroupMessageEvent, question: str) -> str:
             retrieved = await retrieve_memories(group_id, user_id, question, MEMORY_TOP_K)
             memory_context = format_memory_context(retrieved, MEMORY_MAX_CHARS) or None
             if retrieved:
-                logger.info(
-                    "[RAG] group_id={} user_id={} query={} retrieved={}",
-                    group_id,
-                    user_id,
-                    question,
-                    len(retrieved),
-                )
+                if log_message_content_enabled():
+                    logger.info(
+                        "[RAG] group_id={} user_id={} query_chars={} query={} retrieved={}",
+                        group_id,
+                        user_id,
+                        len(question),
+                        safe_log_text(question),
+                        len(retrieved),
+                    )
+                else:
+                    logger.info(
+                        "[RAG] group_id={} user_id={} query_chars={} retrieved={}",
+                        group_id,
+                        user_id,
+                        len(question),
+                        len(retrieved),
+                    )
         except Exception as exc:
             logger.error(
                 "[MEMORY] retrieve failed: {}: {}",
