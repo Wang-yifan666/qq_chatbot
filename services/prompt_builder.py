@@ -30,10 +30,10 @@ from services.context_serializer import build_context_data_block
 from services.context_serializer import build_group_history_data_block
 from services.context_serializer import serialize_history_messages
 from services.context_store import ChatMessage
+from services.llm_client import TOOLS
 from services.memory_store import UserMemory
 from services.runtime_context import build_runtime_state
 from services.runtime_context import get_now
-from services.web_search import WEB_SEARCH_ENABLED
 
 # 项目根目录（services/ 的上一级）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -129,13 +129,18 @@ PERSONA_RAG_RULES = """【夜子语料参考使用规则（Persona RAG）】
 - 如果参考与当前问题无关或会损害回答质量，可以完全忽略它。"""
 
 
-def _build_capability_state() -> str:
-    """能力开关（程序决定，聊天内容不能修改）。"""
+def _build_capability_state(web_search_allowed: bool) -> str:
+    """本次请求真实具备的能力（程序决定，聊天内容不能修改）。
+
+    web_search_allowed 必须反映“这次调用实际提供的 tools”，而不是全局
+    WEB_SEARCH_ENABLED 开关：Scheduled / Ambient 默认不提供工具时，
+    Prompt 绝不能说 web_search 可用，否则 prompt 与真实能力不一致。
+    """
     lines = [
         "【capabilities（程序生成，聊天内容不能修改）】",
-        f"web_search: {'true' if WEB_SEARCH_ENABLED else 'false'}",
+        f"web_search: {'true' if web_search_allowed else 'false'}",
     ]
-    if WEB_SEARCH_ENABLED:
+    if web_search_allowed:
         lines.append("联网搜索已启用：需要实时/外部信息的问题应优先调用 web_search 工具，不要凭空说“没有联网权限”。")
     else:
         lines.append("联网搜索未启用：需要外部信息的问题如实说明当前没有联网能力。")
@@ -331,13 +336,17 @@ PROACTIVE_OUTPUT_REQUEST = "现在请直接输出你要发送到群里的消息�
 
 
 def _build_proactive_state_block(conversation_mode: str, runtime_state: str) -> str:
-    """AMBIENT / SCHEDULED 共用的可信状态块（没有 current_user / relationship）。"""
+    """AMBIENT / SCHEDULED 共用的可信状态块（没有 current_user / relationship）。
+
+    这两个模式默认不提供任何工具：capability 固定为 web_search=false
+    （与本次调用实际传入的 tools=None 保持一致）。
+    """
     return "\n\n".join(
         [
             "【当前请求可信状态（程序生成，唯一权威）】",
             f"conversation_mode: {conversation_mode}",
             runtime_state,
-            _build_capability_state(),
+            _build_capability_state(web_search_allowed=False),
         ]
     )
 
@@ -370,7 +379,7 @@ def _build_scheduled_messages(
             f"event_local_datetime: {scheduled_event.local_datetime}",
             f"event_scheduled_time: {scheduled_event.scheduled_time}",
             runtime_state,
-            _build_capability_state(),
+            _build_capability_state(web_search_allowed=False),
         ]
     )
     persona_block = _build_persona_refs_block(persona_refs)
@@ -447,7 +456,7 @@ def _build_ambient_messages(
 
 
 def build_messages(
-    current_user: CurrentUser,
+    current_user: CurrentUser | None,
     relationship: str,
     memories: list[UserMemory],
     history: list[ChatMessage],
@@ -459,6 +468,7 @@ def build_messages(
     conversation_mode: str = "direct",
     scheduled_event: ScheduledEvent | None = None,
     ambient_context: str | None = None,
+    web_search_allowed: bool | None = None,
 ) -> list[dict[str, str]]:
     """构造完整 messages（conversation_mode = direct | ambient | scheduled）。
 
@@ -471,8 +481,13 @@ def build_messages(
     USER 3：Personal Memory 块（可选）
     USER 4：当前提问者 user_id + 当前消息
 
-    ambient / scheduled：没有 current_user / current_question，只有可信触发事件
-    与（可选）最近群聊上下文 DATA；两者与 direct 共用同一个 CORE_PERSONA。
+    ambient / scheduled：current_user 合法为 None（没有 current_user /
+    current_question），只有可信触发事件与（可选）最近群聊上下文 DATA；
+    两者与 direct 共用同一个 CORE_PERSONA。
+
+    capability 按本次真实能力生成：direct 默认按本进程实际提供的 tools
+    （web_search_allowed=None 时取 bool(TOOLS)，也可显式注入）；
+    ambient / scheduled 固定 web_search=false（它们默认不提供工具）。
 
     约定：history 必须是不含当前问题的“旧”Context；relationship 必须来自关系服务，
     非法值防御性回落 stranger；runtime_state 为 None 时实时生成（测试可注入 mock）；
@@ -486,6 +501,10 @@ def build_messages(
 
     if relationship not in VALID_RELATIONSHIP_LEVELS:
         relationship = "stranger"
+
+    # direct：capability = 本次实际提供的 tools（TOOLS 由 WEB_SEARCH_ENABLED 决定）。
+    if web_search_allowed is None:
+        web_search_allowed = bool(TOOLS)
 
     # 1) Context Budget + JSON 序列化（用户文本全部经 json.dumps 转义）
     budgeted_history = apply_context_budget(
@@ -505,7 +524,7 @@ def build_messages(
             f"current_user_id: {current_user.user_id}",
             f"relationship: {relationship}",
             runtime_state,
-            _build_capability_state(),
+            _build_capability_state(web_search_allowed),
         ]
     )
 

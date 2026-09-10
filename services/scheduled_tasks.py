@@ -7,11 +7,14 @@
     触发源 B：APScheduler cron（nonebot-plugin-apscheduler，AsyncIOScheduler）
               → SCHEDULED_TASK_SPECS 任务注册表（TaskSpec 声明 + 循环解析）
               → SCHEDULED_TASKS: {task_id: ScheduledTask}
-              → setup_scheduled_tasks(driver) 循环注册 cron + catch-up 钩子
+              → setup_scheduled_tasks(driver) 循环注册 cron
+                + catch-up 双时机钩子（on_startup + on_bot_connect）
               → execute_scheduled_task(group_id, task, now)（task 驱动，通用）
                   → 白名单检查 → per-group 共享锁（与 DIRECT/AMBIENT 同一把）
-                  → scheduled_task_runs 原子 claim（每天每群最多一次）
-                  → skip-if-active 判断（最近 X 分钟说过话则跳过）
+                  → 今日状态检查（success/skipped 终态不重试；
+                    running 保守不重试；failed 可 reclaim；无记录可 claim）
+                  → Bot 可用性检查（未连接：不写记录、当天名额保留）
+                  → 原子 claim / reclaim → skip-if-active 判断
                   → Persona RAG 风格参考（可选）
                   → conversation_mode=scheduled 的 messages
                      （唯一 Persona Core = prompt_builder.CORE_PERSONA）
@@ -65,9 +68,11 @@ from services.prompt_builder import ScheduledEvent
 from services.prompt_builder import build_messages
 from services.runtime_context import TIMEZONE
 from services.runtime_context import get_now
+from services.scheduled_task_store import TERMINAL_STATUSES
 from services.scheduled_task_store import claim_scheduled_task
-from services.scheduled_task_store import is_task_done_today
+from services.scheduled_task_store import get_scheduled_task_status
 from services.scheduled_task_store import mark_scheduled_task
+from services.scheduled_task_store import reclaim_scheduled_task
 
 # ==========================================================================
 # 配置解析（进程启动时一次；非法时间 / 非法群号 → ValueError → bot.py 退出）
@@ -285,8 +290,15 @@ async def execute_scheduled_task(
 ) -> str:
     """执行一次定时任务（幂等，绝不抛出）。返回最终 run 状态。
 
-    状态：disabled / unauthorized / claimed（今天已有记录，跳过）/
-    skipped_active（最近说过话）/ success / failed。
+    状态：
+    - disabled / unauthorized      未启用 / 未授权群（不写任何记录）
+    - no_bot                       Bot 未连接：claim 之前返回，当天名额保留，
+                                   等 on_bot_connect 的 catch-up 窗口内再试
+    - done                         今天已确认发送成功（终态，绝不重发）
+    - skipped                      今天已决策跳过（skip-if-active 等终态）
+    - claimed                      记录处于 running（可能已发出 / 并发竞争失败）：
+                                   保守跳过，绝不重试
+    - success / failed             本次执行结果；failed 在窗口内可 reclaim 重试
     """
     task = task or MORNING_GREETING_TASK
     if task is None or not task.enabled:
@@ -302,22 +314,67 @@ async def execute_scheduled_task(
     # 2. 与 DIRECT / AMBIENT 共用同一把 per-group 锁。
     state = get_group_conversation_state(group_id)
     async with state.lock:
-        # 3. 拿锁后重新确认任务状态，再原子 claim（每天每群最多一次）。
+        # 3. 拿锁后重新确认任务状态。
         if not task.enabled:
             return "disabled"
         now = now or get_now()
         today = now.strftime("%Y-%m-%d")
-        if not await claim_scheduled_task(task.task_id, group_id, today):
+
+        # 4. 今日记录检查（retry 语义）：
+        #    success / skipped_* → 终态，今天不再执行；
+        #    running → 可能已发出（含崩溃残留），保守不重试；
+        #    failed → 尚未真正发送成功，窗口内允许 reclaim 重试；
+        #    无记录 → 首次尝试，原子 claim。
+        current = await get_scheduled_task_status(task.task_id, group_id, today)
+        if current in TERMINAL_STATUSES:
             logger.info(
-                "[SCHEDULED] task={} 今日已有执行记录，跳过 group_id={}",
+                "[SCHEDULED] task={} 今日状态={}（终态），跳过 group_id={}",
+                task.task_id,
+                current,
+                group_id,
+            )
+            return "done" if current == "success" else "skipped"
+        if current == "running":
+            logger.info(
+                "[SCHEDULED] task={} 今日记录处于 running（可能已发送），保守跳过 group_id={}",
                 task.task_id,
                 group_id,
             )
             return "claimed"
 
+        # 5. Bot 可用性检查必须放在 claim 之前：
+        #    NoneBot 先启动、NapCat 后连接的 Reverse WebSocket 场景下，
+        #    未连接时绝不写任何记录——当天名额保留，等 on_bot_connect 再试。
+        bot = get_onebot_bot()
+        if bot is None:
+            logger.warning(
+                "[SCHEDULED] 无可用 OneBot 连接，task={} 暂不执行（不占用当天名额）group_id={}",
+                task.task_id,
+                group_id,
+            )
+            return "no_bot"
+
+        # 6. 原子认领：无记录 → claim；failed → reclaim。
+        if current is None:
+            if not await claim_scheduled_task(task.task_id, group_id, today):
+                logger.info(
+                    "[SCHEDULED] task={} claim 失败（并发竞争），跳过 group_id={}",
+                    task.task_id,
+                    group_id,
+                )
+                return "claimed"
+        else:
+            if not await reclaim_scheduled_task(task.task_id, group_id, today):
+                logger.info(
+                    "[SCHEDULED] task={} reclaim 失败（并发竞争或状态变化），跳过 group_id={}",
+                    task.task_id,
+                    group_id,
+                )
+                return "claimed"
+
         status = "failed"
         try:
-            # 4. skip-if-active：最近 X 分钟内说过话（主动/被动）→ 本次跳过。
+            # 7. skip-if-active：最近 X 分钟内说过话（主动/被动）→ 本次跳过（终态）。
             if await has_recent_bot_message(group_id, task.skip_if_active_minutes):
                 logger.info(
                     "[SCHEDULED] 最近 {} 分钟内已发言，task={} 跳过 group_id={}",
@@ -328,21 +385,11 @@ async def execute_scheduled_task(
                 status = "skipped_active"
                 return status
 
-            # 5. 必须存在可用的 OneBot 连接；Bot 离线只记日志，不崩溃。
-            bot = get_onebot_bot()
-            if bot is None:
-                logger.warning(
-                    "[SCHEDULED] 无可用 OneBot 连接，task={} 未发送 group_id={}",
-                    task.task_id,
-                    group_id,
-                )
-                return status
-
-            # 6. 可选最近群聊上下文（DB 不可用 → []，允许“没有上下文”）。
+            # 8. 可选最近群聊上下文（DB 不可用 → []，允许“没有上下文”）。
             history = await get_recent_messages(group_id, CONTEXT_MESSAGE_LIMIT)
             persona_refs = await _retrieve_persona_refs(task, history)
 
-            # 7. conversation_mode=scheduled：没有 current_user / current_question。
+            # 9. conversation_mode=scheduled：没有 current_user / current_question。
             event = ScheduledEvent(
                 event_type=task.event_type,
                 local_datetime=now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -359,20 +406,21 @@ async def execute_scheduled_task(
                 scheduled_event=event,
             )
 
-            # 8. 统一 LLM 调用：工具权限属于 task capability——
-            #    默认 allow_tools=False（无工具）；需要联网的新任务（如 daily_news）
-            #    把 allow_tools 设为 True 后才传真正的工具 schema（由 WEB_SEARCH_ENABLED 决定）。
+            # 10. 统一 LLM 调用：工具权限属于 task capability——
+            #     allow_tools=False（默认）不提供任何工具，Prompt 的 capability
+            #     也只会说 web_search=false（prompt_builder 按本次真实能力生成）。
             tools = TOOLS if task.allow_tools else None
             answer, provider = await ask_with_fallback(messages, tools=tools)
             if not answer:
                 logger.error(
-                    "[SCHEDULED] AI 调用失败，task={} 未发送 group_id={}",
+                    "[SCHEDULED] AI 调用失败，task={} 未发送 group_id={}（failed，窗口内可重试）",
                     task.task_id,
                     group_id,
                 )
                 return status
 
-            # 9. 主动发送 + 成功后写 Context（role=assistant，与 DIRECT 同一张表）。
+            # 11. 主动发送 + 成功后写 Context（role=assistant，与 DIRECT 同一张表，
+            #     只写一次；NapCat 的 self-message 回报由 context_recorder 跳过）。
             if not await send_group_message(bot, group_id, answer):
                 return status
             await save_assistant_message(group_id, getattr(bot, "self_id", None), answer)
@@ -395,8 +443,8 @@ async def execute_scheduled_task(
                 redact_secrets(str(exc)),
             )
         finally:
-            # 保守策略：即使发送成功但状态更新失败，记录仍是 'running'，
-            # 今天的任何重试 / 多实例 / catch-up 都会因唯一约束跳过（宁少一次）。
+            # 保守策略：即使发送成功但状态更新失败，记录仍停在 'running'，
+            # 今天的任何重试 / 多实例 / catch-up 都会跳过（宁少一次，不重复发）。
             await mark_scheduled_task(task.task_id, group_id, today, status)
         return status
 
@@ -432,31 +480,52 @@ def _make_task_job(task: ScheduledTask):
     return job
 
 
-def _make_catchup(task: ScheduledTask):
-    """生成一个任务的启动 catch-up 钩子。
+# ==========================================================================
+# catch-up（v0.4.x：启动 + Bot 连接两个时机）
+#
+# Reverse WebSocket：NoneBot 先启动、NapCat 后连接。on_startup 时通常还没有
+# Bot，因此 catch-up 挂在两个钩子上：
+#   - on_startup：Bot 已连接（或随后立刻连接）时立即补；
+#   - on_bot_connect：NapCat 晚几秒 / 晚几分钟连接时再补（真正的兜底）。
+# 两者都只做“窗口内且今天没有终态记录”的检查，真正执行交给
+# execute_scheduled_task 的原子 claim / reclaim，绝不重复发送。
+# ==========================================================================
 
-    claim 幂等保证：即使 catch-up 与 cron / 多实例并发，每天每群仍最多一次。
-    """
 
-    async def _catchup() -> None:
-        if not task.enabled:
-            return
-        now = get_now()
-        if not within_catchup_window(now, task):
-            return
-        today = now.strftime("%Y-%m-%d")
-        for group_id in sorted(task.target_group_ids):
-            if await is_task_done_today(task.task_id, group_id, today):
-                continue
-            logger.info(
-                "[SCHEDULED] catch-up：启动时补执行今日 task={} group_id={}",
-                task.task_id,
-                group_id,
-            )
-            # 不阻塞启动：后台任务逐个执行；execute 内部自带 claim / 锁 / 全兜底。
-            asyncio.create_task(execute_scheduled_task(group_id, task, now))
+async def _task_catchup(task: ScheduledTask) -> None:
+    """单个任务的 catch-up 检查：窗口内 + 今天可重试 → 逐个目标群尝试执行。"""
+    if not task.enabled:
+        return
+    now = get_now()
+    if not within_catchup_window(now, task):
+        return
+    today = now.strftime("%Y-%m-%d")
+    for group_id in sorted(task.target_group_ids):
+        status = await get_scheduled_task_status(task.task_id, group_id, today)
+        if status in TERMINAL_STATUSES or status == "running":
+            # success / skipped_* → 终态；running → 可能已发出。都不重试。
+            continue
+        logger.info(
+            "[SCHEDULED] catch-up：尝试补执行 task={} group_id={}（今日状态={}）",
+            task.task_id,
+            group_id,
+            status or "none",
+        )
+        # 不阻塞启动/连接：后台任务执行；execute 内部自带 Bot 检查 / claim / 锁 / 全兜底。
+        asyncio.create_task(execute_scheduled_task(group_id, task, now))
 
-    return _catchup
+
+async def _run_all_catchups() -> None:
+    """遍历注册表里所有启用任务执行 catch-up 检查（startup / bot_connect 共用）。"""
+    for task in SCHEDULED_TASKS.values():
+        if task.enabled:
+            await _task_catchup(task)
+
+
+async def _on_bot_connect(bot) -> None:
+    """NapCat 建立 OneBot 连接后：窗口内的未完成任务获得补执行机会。"""
+    logger.info("[SCHEDULED] OneBot 连接建立，检查定时任务 catch-up 窗口")
+    await _run_all_catchups()
 
 
 # ==========================================================================
@@ -495,7 +564,6 @@ def setup_scheduled_tasks(driver) -> None:
             misfire_grace_time=max(60, task.catchup_minutes * 60),
             replace_existing=True,
         )
-        driver.on_startup(_make_catchup(task))
         registered += 1
         logger.info(
             "[SCHEDULED] 已注册定时任务 {}：cron={:02d}:{:02d} timezone={} 目标群数={} "
@@ -510,3 +578,7 @@ def setup_scheduled_tasks(driver) -> None:
         )
     if registered == 0:
         logger.warning("[SCHEDULED] 没有任何启用的定时任务")
+        return
+    # catch-up 挂两个时机：启动（Bot 可能已连上）与 Bot 连接（NapCat 后连上的兜底）。
+    driver.on_startup(_run_all_catchups)
+    driver.on_bot_connect(_on_bot_connect)

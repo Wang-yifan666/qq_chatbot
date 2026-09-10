@@ -15,6 +15,7 @@ from services.scheduled_task_store import claim_scheduled_task
 from services.scheduled_task_store import get_scheduled_task_status
 from services.scheduled_task_store import is_task_done_today
 from services.scheduled_task_store import mark_scheduled_task
+from services.scheduled_task_store import reclaim_scheduled_task
 
 
 def _tid(prefix: str) -> str:
@@ -70,6 +71,42 @@ class TestMarkAndQuery:
         task_id = _tid("none")
         assert await get_scheduled_task_status(task_id, 111, "2025-01-08") is None
         assert await is_task_done_today(task_id, 111, "2025-01-08") is False
+
+
+class TestReclaim:
+    async def test_failed_can_be_reclaimed(self):
+        task_id = _tid("reclaim")
+        date = "2025-01-09"
+        await claim_scheduled_task(task_id, 111, date)
+        await mark_scheduled_task(task_id, 111, date, "failed")
+        assert await reclaim_scheduled_task(task_id, 111, date) is True
+        assert await get_scheduled_task_status(task_id, 111, date) == "running"
+
+    async def test_success_never_reclaimed(self):
+        task_id = _tid("reclaim-success")
+        date = "2025-01-10"
+        await claim_scheduled_task(task_id, 111, date)
+        await mark_scheduled_task(task_id, 111, date, "success")
+        assert await reclaim_scheduled_task(task_id, 111, date) is False
+        assert await get_scheduled_task_status(task_id, 111, date) == "success"
+
+    async def test_skipped_never_reclaimed(self):
+        task_id = _tid("reclaim-skipped")
+        date = "2025-01-11"
+        await claim_scheduled_task(task_id, 111, date)
+        await mark_scheduled_task(task_id, 111, date, "skipped_active")
+        assert await reclaim_scheduled_task(task_id, 111, date) is False
+
+    async def test_running_never_reclaimed(self):
+        task_id = _tid("reclaim-running")
+        date = "2025-01-12"
+        await claim_scheduled_task(task_id, 111, date)
+        # 仍是 running（可能已发出）→ 不允许 reclaim
+        assert await reclaim_scheduled_task(task_id, 111, date) is False
+
+    async def test_reclaim_without_record_fails(self):
+        task_id = _tid("reclaim-none")
+        assert await reclaim_scheduled_task(task_id, 111, "2025-01-13") is False
 
 
 class TestHasRecentBotMessage:

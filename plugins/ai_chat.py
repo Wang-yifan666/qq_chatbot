@@ -48,6 +48,7 @@ from services.context_store import CONTEXT_MESSAGE_LIMIT
 from services.context_store import add_message
 from services.context_store import get_recent_messages
 from services.group_access import is_group_allowed
+from services.group_conversation import cancel_pending_ambient
 from services.group_conversation import get_group_conversation_state
 from services.llm_client import AI_PROVIDER
 from services.llm_client import TOOLS
@@ -104,6 +105,11 @@ async def handle(event: GroupMessageEvent):
         )
         return
 
+    # 0.5 DIRECT 优先：这是授权群的真正 direct interaction（matcher rule 已保证
+    #     to_me），立即取消该群 pending 的 AMBIENT 等待任务——
+    #     不让旧 timer 到点后白跑一次 decision LLM，最后才被冷却/锁挡掉。
+    cancel_pending_ambient(event.group_id)
+
     # get_plaintext() 只保留纯文本，自动去掉 @ 本体和所有 CQ Code。
     question = event.get_plaintext().strip()
 
@@ -126,8 +132,17 @@ async def handle(event: GroupMessageEvent):
             len(question),
         )
 
-    # 只 @ 了机器人、后面没有问题：保持 v0.1 行为，直接提示，不调用 API
+    # 只 @ 了机器人、后面没有问题：保持 v0.1 行为，直接提示，不调用 API。
+    # 与其它模式一致：机器人实际发出的这句话也要写进 Context（只写一次），
+    # 并且让 has_recent_bot_message 生效——DIRECT 刚结束时 AMBIENT 不会马上插话。
     if not question:
+        await add_message(
+            group_id=event.group_id,
+            user_id=event.self_id,
+            nickname=BOT_NAME,
+            role="assistant",
+            content="有什么想问我的？",
+        )
         await chat.finish("有什么想问我的？")
 
     answer = await _answer(event, question)

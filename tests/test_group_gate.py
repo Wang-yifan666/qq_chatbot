@@ -8,6 +8,7 @@
   绝不访问真实 QQ / LLM / 搜索服务。
 """
 
+import asyncio
 from types import SimpleNamespace
 
 from nonebot.exception import FinishedException
@@ -209,6 +210,42 @@ async def _gate_scenario() -> None:
     await _call_handler(ai.handle, ev)
     assert ai_chat.finished[-1] == "有什么想问我的？"
     assert calls["answer"] == 2
+    # @-only 的提示语也写进 Context（assistant 只写一次）：
+    # 这样 DIRECT 刚结束时 has_recent_bot_message 生效，ambient 不会马上插话。
+    assert await _count(
+        "messages", "group_id = 111 AND role = 'assistant' AND content = '有什么想问我的？'"
+    ) == 1
+
+    # ===== DIRECT 取消 pending AMBIENT（含 @-only 提前返回路径） =====
+    from services.group_conversation import get_group_conversation_state
+
+    gstate = get_group_conversation_state(111)
+
+    async def _pending():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            pass
+
+    # ambient 等待中，用户 @夜子 → pending 立即取消，只执行 DIRECT
+    pending_ambient = asyncio.create_task(_pending())
+    gstate.ambient_pending_task = pending_ambient
+    ev = FakeEvent(111, 1001, 999, "@bot hello")
+    await _call_handler(ai.handle, ev)
+    await asyncio.sleep(0.02)  # 让 cancel 请求在事件循环里完成投递
+    assert pending_ambient.cancelled(), "DIRECT 应取消 pending ambient"
+    assert gstate.ambient_pending_task is None
+    await asyncio.gather(pending_ambient, return_exceptions=True)
+
+    # 只 @ 没有正文的提前返回路径同样取消 pending
+    pending_ambient = asyncio.create_task(_pending())
+    gstate.ambient_pending_task = pending_ambient
+    ev = FakeEvent(111, 1001, 999, "@bot")
+    await _call_handler(ai.handle, ev)
+    await asyncio.sleep(0.02)
+    assert pending_ambient.cancelled(), "@-only 路径也应取消 pending ambient"
+    assert gstate.ambient_pending_task is None
+    await asyncio.gather(pending_ambient, return_exceptions=True)
 
     # 白名单群普通消息 → 正常写入 messages + users（context_recorder 永不写关系/记忆）
     ev = FakeEvent(111, 1003, 999, "hello from allowed group")

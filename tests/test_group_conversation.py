@@ -2,6 +2,7 @@
 
 import asyncio
 
+from services.group_conversation import cancel_pending_ambient
 from services.group_conversation import get_group_conversation_state
 
 
@@ -56,3 +57,23 @@ async def test_shared_lock_serializes_across_modes():
     t2 = asyncio.create_task(waiter())
     await asyncio.gather(t1, t2)
     assert order == ["first", "second"]
+
+
+async def test_cancel_pending_ambient():
+    """DIRECT 到来时：pending ambient 任务立即取消且置空。"""
+    state = get_group_conversation_state(666)
+
+    async def sleeper():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            pass
+
+    pending = asyncio.create_task(sleeper())
+    state.ambient_pending_task = pending
+    assert cancel_pending_ambient(666) is True
+    await asyncio.sleep(0.02)
+    assert pending.cancelled()
+    assert state.ambient_pending_task is None  # 取消后置空（重建前不残留）
+    # 没有 pending 时是安全的 no-op
+    assert cancel_pending_ambient(666) is False

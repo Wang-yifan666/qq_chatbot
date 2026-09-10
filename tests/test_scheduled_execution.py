@@ -156,9 +156,9 @@ class TestExecuteMorningGreeting:
     ):
         task = make_task(task_id="twice")
         assert await st.execute_scheduled_task(111, task, NOW) == "success"
+        # success 是终态：当天任何重试 / 重启 / catch-up 都绝不重发
         status = await st.execute_scheduled_task(111, task, NOW)
-        assert status == "claimed"
-        # 第二次完全没有模型调用 / 发送
+        assert status == "done"
         assert len(fake_llm["messages"]) == 1
         assert len(fake_bot["sent"]) == 1
 
@@ -171,7 +171,7 @@ class TestExecuteMorningGreeting:
         assert await get_scheduled_task_status(task.task_id, 111, "2025-01-01") == "success"
         assert await get_scheduled_task_status(task.task_id, 222, "2025-01-01") == "success"
 
-    async def test_skip_when_recently_active(self, monkeypatch, fake_llm, fixed_clock):
+    async def test_skip_when_recently_active(self, monkeypatch, fake_llm, fake_bot, fixed_clock):
         task = make_task(task_id="active")
 
         async def active(group_id, minutes):
@@ -181,16 +181,42 @@ class TestExecuteMorningGreeting:
         status = await st.execute_scheduled_task(111, task, NOW)
         assert status == "skipped_active"
         assert fake_llm["messages"] == []
+        # skip-if-active 是终态：窗口内不再重试
         assert await get_scheduled_task_status(task.task_id, 111, "2025-01-01") == "skipped_active"
 
-    async def test_bot_offline_fails_without_crash(self, monkeypatch, fake_llm, fixed_clock):
+    async def test_bot_offline_keeps_daily_slot_open(self, monkeypatch, fake_llm, fixed_clock):
+        """NoneBot 先启动、NapCat 未连接：不写任何记录，当天名额保留。"""
         task = make_task(task_id="offline")
         monkeypatch.setattr(st, "get_onebot_bot", lambda: None)
         status = await st.execute_scheduled_task(111, task, NOW)
-        assert status == "failed"
-        # bot 检查在生成之前：离线时不做任何模型调用
+        assert status == "no_bot"
+        # bot 检查在 claim 之前：离线时没有模型调用、没有执行记录
         assert fake_llm["messages"] == []
-        assert await get_scheduled_task_status(task.task_id, 111, "2025-01-01") == "failed"
+        assert await get_scheduled_task_status(task.task_id, 111, "2025-01-01") is None
+
+    async def test_bot_connects_later_then_executes(self, monkeypatch, fixed_clock):
+        """08:00 离线 → no_bot（无名额占用）→ NapCat 连接 → 窗口内执行成功。"""
+        task = make_task(task_id="latebot")
+        monkeypatch.setattr(st, "get_onebot_bot", lambda: None)
+        assert await st.execute_scheduled_task(111, task, NOW) == "no_bot"
+
+        monkeypatch.setattr(st, "get_onebot_bot", lambda: SimpleNamespace(self_id="999"))
+        sent: list = []
+
+        async def send(bot, group_id, text):
+            sent.append((group_id, text))
+            return True
+
+        monkeypatch.setattr(st, "send_group_message", send)
+
+        async def llm(messages, tools=None):
+            return ("早上好。", "deepseek")
+
+        monkeypatch.setattr(st, "ask_with_fallback", llm)
+        status = await st.execute_scheduled_task(111, task, NOW)
+        assert status == "success"
+        assert sent == [(111, "早上好。")]
+        assert await get_scheduled_task_status(task.task_id, 111, "2025-01-01") == "success"
 
     async def test_provider_failure_failed(self, monkeypatch, fake_bot, fixed_clock):
         task = make_task(task_id="noprovider")
@@ -203,6 +229,43 @@ class TestExecuteMorningGreeting:
         assert status == "failed"
         assert fake_bot["sent"] == []
         assert await get_scheduled_task_status(task.task_id, 111, "2025-01-01") == "failed"
+
+    async def test_failed_is_reclaimable_within_window(self, monkeypatch, fixed_clock):
+        """发送失败（failed）不是终态：窗口内再次执行会 reclaim 并重试。"""
+        task = make_task(task_id="retryprov")
+        monkeypatch.setattr(st, "get_onebot_bot", lambda: SimpleNamespace(self_id="999"))
+        sent: list = []
+
+        async def send(bot, group_id, text):
+            sent.append((group_id, text))
+            return True
+
+        monkeypatch.setattr(st, "send_group_message", send)
+
+        async def failing_llm(messages, tools=None):
+            return (None, "deepseek")
+
+        monkeypatch.setattr(st, "ask_with_fallback", failing_llm)
+        assert await st.execute_scheduled_task(111, task, NOW) == "failed"
+
+        async def ok_llm(messages, tools=None):
+            return ("早上好。", "deepseek")
+
+        monkeypatch.setattr(st, "ask_with_fallback", ok_llm)
+        assert await st.execute_scheduled_task(111, task, NOW) == "success"
+        assert sent == [(111, "早上好。")]
+        assert await get_scheduled_task_status(task.task_id, 111, "2025-01-01") == "success"
+
+    async def test_running_record_never_retried(self, monkeypatch, fake_llm, fake_bot, fixed_clock):
+        """running（可能已发出，含崩溃残留）绝不重试：宁少一次不重复发。"""
+        from services.scheduled_task_store import claim_scheduled_task
+
+        task = make_task(task_id="running")
+        assert await claim_scheduled_task(task.task_id, 111, "2025-01-01") is True
+        status = await st.execute_scheduled_task(111, task, NOW)
+        assert status == "claimed"
+        assert fake_llm["messages"] == []
+        assert len(fake_bot["sent"]) == 0
 
     async def test_send_failure_failed(self, monkeypatch, fake_llm, fixed_clock):
         task = make_task(task_id="sendfail")
@@ -274,16 +337,16 @@ class TestStartupCatchup:
             st, "get_now", lambda: datetime(2025, 1, 1, 8, 10, tzinfo=TZ)
         )
 
-        async def not_done(task_id, group_id, date):
-            return False
+        async def no_record(task_id, group_id, date):
+            return None
 
-        monkeypatch.setattr(st, "is_task_done_today", not_done)
+        monkeypatch.setattr(st, "get_scheduled_task_status", no_record)
         task = make_task(task_id="catchup", target_group_ids=frozenset({111, 222}))
-        await st._make_catchup(task)()
+        await st._task_catchup(task)
         await asyncio.sleep(0.05)
         assert sorted(executed) == [111, 222]
 
-    async def test_catchup_skips_groups_already_done_today(self, monkeypatch):
+    async def test_catchup_skips_terminal_and_running(self, monkeypatch):
         executed: list[int] = []
 
         async def fake_exec(group_id, task=None, now=None):
@@ -295,14 +358,35 @@ class TestStartupCatchup:
             st, "get_now", lambda: datetime(2025, 1, 1, 8, 10, tzinfo=TZ)
         )
 
-        async def done(task_id, group_id, date):
-            return group_id == 111
+        async def status_of(task_id, group_id, date):
+            return {111: "success", 222: "skipped_active", 333: "running"}.get(group_id)
 
-        monkeypatch.setattr(st, "is_task_done_today", done)
-        task = make_task(task_id="catchup2", target_group_ids=frozenset({111, 222}))
-        await st._make_catchup(task)()
+        monkeypatch.setattr(st, "get_scheduled_task_status", status_of)
+        task = make_task(task_id="catchup4", target_group_ids=frozenset({111, 222, 333}))
+        await st._task_catchup(task)
         await asyncio.sleep(0.05)
-        assert executed == [222]
+        assert executed == []
+
+    async def test_catchup_retries_failed_status(self, monkeypatch):
+        executed: list[int] = []
+
+        async def fake_exec(group_id, task=None, now=None):
+            executed.append(group_id)
+            return "success"
+
+        monkeypatch.setattr(st, "execute_scheduled_task", fake_exec)
+        monkeypatch.setattr(
+            st, "get_now", lambda: datetime(2025, 1, 1, 8, 10, tzinfo=TZ)
+        )
+
+        async def status_of(task_id, group_id, date):
+            return "failed"
+
+        monkeypatch.setattr(st, "get_scheduled_task_status", status_of)
+        task = make_task(task_id="catchup5", target_group_ids=frozenset({111}))
+        await st._task_catchup(task)
+        await asyncio.sleep(0.05)
+        assert executed == [111]
 
     async def test_catchup_not_run_before_scheduled_time(self, monkeypatch):
         executed: list[int] = []
@@ -317,6 +401,46 @@ class TestStartupCatchup:
             st, "get_now", lambda: datetime(2025, 1, 1, 7, 59, tzinfo=TZ)
         )
         task = make_task(task_id="catchup3", target_group_ids=frozenset({111}))
-        await st._make_catchup(task)()
+        await st._task_catchup(task)
         await asyncio.sleep(0.05)
         assert executed == []
+
+    async def test_catchup_not_run_beyond_window(self, monkeypatch):
+        executed: list[int] = []
+
+        async def fake_exec(group_id, task=None, now=None):
+            executed.append(group_id)
+            return "success"
+
+        monkeypatch.setattr(st, "execute_scheduled_task", fake_exec)
+        # 10:30 启动：超过 30 分钟窗口，不补发“早晨任务”
+        monkeypatch.setattr(
+            st, "get_now", lambda: datetime(2025, 1, 1, 10, 30, tzinfo=TZ)
+        )
+        task = make_task(task_id="catchup6", target_group_ids=frozenset({111}))
+        await st._task_catchup(task)
+        await asyncio.sleep(0.05)
+        assert executed == []
+
+    async def test_bot_connect_triggers_catchup(self, monkeypatch):
+        calls: list = []
+
+        async def fake_run_all():
+            calls.append("catchup")
+
+        monkeypatch.setattr(st, "_run_all_catchups", fake_run_all)
+        await st._on_bot_connect("fake-bot")
+        assert calls == ["catchup"]
+
+    async def test_run_all_catchups_iterates_enabled_tasks(self, monkeypatch):
+        seen: list[str] = []
+        task_a = make_task(task_id="taska", enabled=True)
+        task_b = make_task(task_id="taskb", enabled=False)
+
+        async def fake_task_catchup(task):
+            seen.append(task.task_id)
+
+        monkeypatch.setattr(st, "SCHEDULED_TASKS", {"a": task_a, "b": task_b})
+        monkeypatch.setattr(st, "_task_catchup", fake_task_catchup)
+        await st._run_all_catchups()
+        assert seen == ["taska"]

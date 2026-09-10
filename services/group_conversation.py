@@ -50,3 +50,19 @@ def get_group_conversation_state(group_id: int) -> GroupConversationState:
     if state is None:
         state = _states[group_id] = GroupConversationState(group_id=group_id)
     return state
+
+
+def cancel_pending_ambient(group_id: int) -> bool:
+    """取消该群正在等待安静期的 AMBIENT 任务（DIRECT 到达时调用）。
+
+    返回是否真的取消了一个未完成的任务。取消后 ambient_pending_task 置空：
+    不会出现“旧 timer 到点后又白跑一次 decision LLM”的情况。
+    """
+    state = get_group_conversation_state(group_id)
+    pending = state.ambient_pending_task
+    if pending is not None and not pending.done():
+        pending.cancel()
+        state.ambient_pending_task = None
+        return True
+    state.ambient_pending_task = None
+    return False

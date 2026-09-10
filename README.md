@@ -56,8 +56,9 @@ QQ 服务器 / NapCat（OneBot 11 协议）                     morning_greeting
 │     同时 upsert 用户身份（users 表）；只记录，不回复，不调用 AI
 │
 ├─ plugins/ambient.py（priority=30，v0.4 自然插话，默认关闭）
-│     普通消息 → 安静期 debounce → cheap gate（太短/冷却/每小时上限）
+│     每条真人消息重置安静期 → 安静后按最近片段 cheap gate（片段太短/冷却/每小时上限）
 │     → LLM 决策 {"should_reply": bool}（允许沉默）→ 主动生成 → 发送 → 写 Context
+│     DIRECT 到来时立即取消本群 pending ambient
 │
 ├─ plugins/ai_chat.py（priority=10, block=True，只有 @机器人 才触发）
 │     ⓪ 群访问白名单检查：未授权群直接丢弃（不回复、不调 AI、不落库）
@@ -134,29 +135,39 @@ Scheduler / 事件只决定**是否触发**；**怎么说**永远由本地人格
 （`persona.txt`，或 `PERSONA_FILE` 指定）这一唯一来源决定。
 
 - **DIRECT**（触发源 A：@/回复，保持 v0.3.1 行为）：现有 `plugins/ai_chat.py` 流程，
-  优先级最高，本版本行为完全不变；
+  优先级最高；授权群的 direct interaction 一进来就取消该群 pending 的 AMBIENT
+  等待任务（不白跑 decision LLM），@-only 提示语也写进 Context；
 - **SCHEDULED**（触发源 B：真实 Cron，不依赖任何 QQ 消息）：`nonebot-plugin-apscheduler`
   的 `AsyncIOScheduler` + `CronTrigger(hour, minute, timezone=BOT_TIMEZONE)`；
-  第一版只有 `morning_greeting` 一个任务（通用 `ScheduledTask` 抽象：
-  task_id / trigger / target_groups / enabled / event_type，后续可加 night/birthday 等，
-  本版本不提前实现）。执行链路：白名单 → 共享 per-group 锁 →
-  `scheduled_task_runs` 原子 claim（`UNIQUE(task_id, group_id, scheduled_date)`，
-  每天每群最多一次，重启/多实例/08:05 重启都不重复）→ skip-if-active →
-  Persona RAG 风格参考 → `conversation_mode=scheduled`（无 current_user、
-  无伪造记忆）→ 统一 LLM 调用（**默认无工具**）→ 主动 `send_group_msg` →
-  完整内容以 role=assistant 写入 Context → 更新执行状态；支持启动 catch-up
-  （08:10 启动且窗口 30 分钟内补一次，10:30 启动不补）；
+  `SCHEDULED_TASK_SPECS` 注册表（第一版 morning_greeting + night_greeting，
+  通用 `ScheduledTask` 抽象：task_id / trigger / target_groups / enabled / event_type）。
+  执行链路：白名单 → 共享 per-group 锁 → 今日状态检查 → Bot 可用性检查 →
+  `scheduled_task_runs` 原子 claim/reclaim（`UNIQUE(task_id, group_id, scheduled_date)`）
+  → skip-if-active → Persona RAG 风格参考 → `conversation_mode=scheduled`
+  （无 current_user、无伪造记忆）→ 统一 LLM 调用（**默认无工具**）→ 主动
+  `send_group_msg` → 完整内容以 role=assistant 写入 Context → 更新执行状态。
+  状态机：success/skipped 是终态（当天绝不再发）；running 保守不重试（可能已发出）；
+  failed（Bot 未连接/发送失败/模型失败）在 catch-up 窗口内可原子 reclaim 重试；
+  **Bot 未连接时在 claim 之前返回、不写任何记录，当天名额保留**。
+  catch-up 挂在两个时机：`on_startup` + `on_bot_connect`——NapCat 比 NoneBot
+  晚几秒连接也不会永久漏发（08:10 连接且窗口 30 分钟内补一次，10:30 不补）；
 - **AMBIENT**（触发源 A：普通群消息，自然插话 MVP）：`plugins/ambient.py`
-  （priority=30，晚于 context_recorder）→ 群里安静 `AMBIENT_QUIET_SECONDS` 秒
-  → cheap gate（消息太短 / `AMBIENT_COOLDOWN_MINUTES` 冷却 / 每小时
-  `AMBIENT_MAX_PER_HOUR` 次上限，全部不调用 LLM）→ LLM 决策
-  （严格 JSON `{"should_reply": bool}`，**允许什么都不说**，解析失败按不说话）
-  → 通过才进入 `conversation_mode=ambient` 生成管线 → 主动发送 → 写 Context。
-  绝不每条普通消息都回复、没有“每 N 条随机说一次”；
+  （priority=30，晚于 context_recorder）。**activity 与 reply candidate 分离**：
+  每条真人消息（无论长短，“哈哈”也算）都重置 quiet timer；群里安静
+  `AMBIENT_QUIET_SECONDS` 秒后，取最近一小段聊天片段做 cheap gate
+  （片段太短 / `AMBIENT_COOLDOWN_MINUTES` 冷却 / 每小时 `AMBIENT_MAX_PER_HOUR`
+  次上限，全部不调用 LLM）→ LLM 决策（严格 JSON `{"should_reply": bool}`，
+  **允许什么都不说**，解析失败按不说话）→ 通过才进入 `conversation_mode=ambient`
+  生成管线 → 主动发送 → 写 Context。绝不每条普通消息都回复、没有“每 N 条随机说一次”；
+  决策面向“是否存在适合这个角色加入的机会”（吐槽/情绪/玩笑/接话点/提到夜子/
+  已有连续性），而不是只做知识型回答；**怎么说仍完全由本地 Persona 决定**；
 - **三种模式共用同一个 Persona Core**（`prompt_builder.CORE_PERSONA`，唯一读取
   `persona.txt` 的地方），共用 `services/group_conversation.py` 的 per-group 锁与
   `services/llm_client.py` 的统一 Provider/fallback。Persona RAG 永远只是表达参考，
   不能覆盖本地 Persona Core；本地人格与内置默认冲突时以本地人格为准（修改后重启生效）。
+  **capability 按本次真实能力生成**：只有 DIRECT 实际提供 web_search 工具时才在
+  Prompt 说 true；Scheduled / Ambient 默认无工具，Prompt 永远说 false——不会出现
+  “全局开了搜索、模型以为能用、实际没有 tools”的不一致。
 
 **新增一个定时任务（三步）**：`services/scheduled_tasks.py` 的
 `SCHEDULED_TASK_SPECS` 注册表加一行 `TaskSpec(prefix/task_id/event_type/
@@ -253,19 +264,25 @@ per-group 锁、claim 幂等、catch-up、skip-if-active、Persona 单一来源�
     性格形容词、不复制人格 Prompt、不维护固定早安文案；Persona RAG 只作表达参考，
     永远不覆盖 Persona Core；
   - **Scheduled**：`nonebot-plugin-apscheduler` 真实 Cron（`BOT_TIMEZONE` 时区，
-    非法 `MORNING_GREETING_TIME` 启动报错退出）；通用 `ScheduledTask` 抽象，
-    第一版只实现 `morning_greeting`；`scheduled_task_runs` 表
-    `UNIQUE(task_id, group_id, scheduled_date)` 原子 claim（每天每群最多一次，
-    重启 / 多实例 / 08:05 重启都不重复，宁可少一次不重复发）；启动 catch-up 窗口；
+    非法 `MORNING_GREETING_TIME` 启动报错退出）；`SCHEDULED_TASK_SPECS` 注册表
+    （morning_greeting + night_greeting）；`scheduled_task_runs` 表
+    `UNIQUE(task_id, group_id, scheduled_date)` 原子 claim/reclaim：success/skipped
+    是终态、running 保守不重试（可能已发出）、failed 在窗口内可 reclaim 重试、
+    Bot 未连接时**不写记录**（当天名额保留）；catch-up 挂 `on_startup` +
+    `on_bot_connect`（NapCat 晚连接不永久漏发，宁可少一次不重复发）；
     `MORNING_GREETING_SKIP_IF_ACTIVE_MINUTES` 最近说过话则跳过；默认无工具；
     发送成功后完整内容以 role=assistant 写入 Context（随后“你刚刚说什么”能接上）；
-  - **AMBIENT（MVP）**：普通消息 → 安静期 debounce → cheap gate（太短 / 冷却 /
-    每小时上限，全部不调 LLM）→ 决策 `{"should_reply": bool}`（允许沉默，
-    解析失败按沉默）→ 通过才进入统一生成管线 → 主动发送 → 写 Context；
-    绝不对每条普通消息回复，没有随机“每 N 条说一次”；
+  - **AMBIENT（MVP）**：activity 与 reply candidate 分离——每条真人消息（含“哈哈”）
+    都重置安静期；安静后按最近聊天片段 cheap gate（片段太短 / 冷却 / 每小时上限，
+    全部不调 LLM）→ 决策 `{"should_reply": bool}`（允许社交型参与：
+    吐槽/情绪/玩笑/接话点/提到夜子；允许沉默，解析失败按沉默）→ 通过才进入统一
+    生成管线 → 主动发送 → 写 Context；绝不对每条普通消息回复，没有随机
+    “每 N 条说一次”；DIRECT 到来时立即取消 pending ambient；
   - 三种模式共用 `services/group_conversation.py` 的 per-group 锁（DIRECT > AMBIENT，
     Scheduled 到点后等锁、拿到锁再确认）与 `services/llm_client.py` 的统一
-    Provider / fallback；白名单（fail-closed）对主动发送同样生效。
+    Provider / fallback；白名单（fail-closed）对主动发送同样生效；
+    capability Prompt 按本次真实提供的 tools 生成（Scheduled/Ambient 恒为
+    web_search=false，与它们实际没带工具一致）。
 
 暂不实现（保持范围小）：
 
@@ -1351,7 +1368,9 @@ python scripts/test_group_access.py
 默认全部为 `false`（fail-closed）。按需在 `.env` 开启，并填写
 `MORNING_GREETING_TIME` / `MORNING_GREETING_GROUP_IDS` 等，重启生效。
 定时任务使用 `BOT_TIMEZONE` 时区（不是系统时区）；每天每群最多发送一次，
-Bot 在任务时间前离线、又在 catch-up 窗口内（默认 30 分钟）启动时会补一次。
+NapCat 比 NoneBot 晚连接 / 在任务时间后、catch-up 窗口内（默认 30 分钟）上线时
+会自动补一次（`on_startup` + `on_bot_connect` 两个时机，且只有确认发送成功
+才是终态）。
 
 **Q：早上问候会说什么？**
 由本地 `persona.txt`（Persona Core）决定，代码里没有任何固定早安文案。

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import services.prompt_builder as prompt_builder
 from services.context_store import ChatMessage
 from services.prompt_builder import AMBIENT_EVENT_INSTRUCTION
 from services.prompt_builder import CORE_PERSONA
@@ -206,3 +207,46 @@ class TestPersonaSingleSource:
         )
         for messages in (direct, scheduled, ambient):
             assert messages[0]["content"].startswith(CORE_PERSONA)
+
+
+class TestCapabilityPerMode:
+    """capability 必须反映“本次 conversation 真正提供的能力”，而不是全局开关。"""
+
+    def test_direct_capability_follows_explicit_flag(self):
+        system_true = build_messages(
+            CurrentUser(user_id=1, display_name="小明"), "stranger", [], [], "你好",
+            runtime_state="RUNTIME", web_search_allowed=True,
+        )[0]["content"]
+        assert "web_search: true" in system_true
+        system_false = build_messages(
+            CurrentUser(user_id=1, display_name="小明"), "stranger", [], [], "你好",
+            runtime_state="RUNTIME", web_search_allowed=False,
+        )[0]["content"]
+        assert "web_search: false" in system_false
+
+    def test_direct_default_uses_actual_tools(self, monkeypatch):
+        # 本进程实际提供工具（TOOLS 非空）→ direct 说 true
+        monkeypatch.setattr(prompt_builder, "TOOLS", [{"type": "function"}])
+        system = build_messages(
+            CurrentUser(user_id=1, display_name="小明"), "stranger", [], [], "你好",
+            runtime_state="RUNTIME",
+        )[0]["content"]
+        assert "web_search: true" in system
+
+    def test_scheduled_and_ambient_never_claim_web_search(self, monkeypatch):
+        """即使全局 WEB_SEARCH_ENABLED=true（TOOLS 非空），
+        Scheduled / Ambient 本次没有提供工具，Prompt 必须说 false。"""
+        monkeypatch.setattr(prompt_builder, "TOOLS", [{"type": "function"}])
+        scheduled = build_messages(
+            None, "stranger", [], [], "", runtime_state="RUNTIME",
+            conversation_mode="scheduled",
+            scheduled_event=ScheduledEvent("morning_greeting", "2025-01-01 08:00:00", "08:00"),
+        )[0]["content"]
+        assert "web_search: false" in scheduled
+        assert "web_search: true" not in scheduled
+        ambient = build_messages(
+            None, "stranger", [], [], "", runtime_state="RUNTIME",
+            conversation_mode="ambient", ambient_context="触发片段",
+        )[0]["content"]
+        assert "web_search: false" in ambient
+        assert "web_search: true" not in ambient

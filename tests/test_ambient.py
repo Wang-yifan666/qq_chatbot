@@ -120,77 +120,148 @@ class TestAmbientGate:
         assert not await ambient._ambient_gate_allows(714)
 
 
-class TestOnGroupMessageDebounce:
-    async def test_too_short_message_not_scheduled(self, monkeypatch):
-        monkeypatch.setattr(ambient, "AMBIENT_MIN_MESSAGE_CHARS", 4)
-        scheduled: list[str] = []
+class TestTriggerSnippet:
+    def _msg(self, role, content):
+        return SimpleNamespace(role=role, content=content)
 
-        def fake_schedule(group_id, chunk):
-            scheduled.append(chunk)
+    def test_snippet_takes_recent_user_messages_only(self):
+        history = [
+            self._msg("user", "第一条"),
+            self._msg("assistant", "机器人说的话不算"),
+            self._msg("user", "第二条"),
+            self._msg("user", "第三条"),
+        ]
+        assert ambient.build_trigger_snippet(history) == "第一条\n第二条\n第三条"
+
+    def test_long_then_short_keeps_long_content(self):
+        """A 长消息 + B「哈哈」：安静期从 B 重算，但片段仍包含 A 的内容。"""
+        history = [
+            self._msg("user", "今天老板让我改了五遍，人都麻了"),
+            self._msg("user", "哈哈"),
+        ]
+        snippet = ambient.build_trigger_snippet(history)
+        assert "今天老板让我改了五遍" in snippet
+        assert "哈哈" in snippet
+
+    def test_snippet_bounded(self):
+        history = [self._msg("user", "x" * 300) for _ in range(5)]
+        snippet = ambient.build_trigger_snippet(history)
+        assert len(snippet) <= ambient.SNIPPET_MAX_CHARS
+
+
+class TestOnGroupMessageDebounce:
+    async def test_short_message_still_resets_timer(self, monkeypatch):
+        """activity 语义：「哈哈」不单独作为 candidate，但必须重置 quiet timer。"""
+        monkeypatch.setattr(ambient, "AMBIENT_MIN_MESSAGE_CHARS", 4)
+        scheduled: list[int] = []
+
+        def fake_schedule(group_id):
+            scheduled.append(group_id)
 
         monkeypatch.setattr(ambient, "_schedule_decision", fake_schedule)
         await ambient.on_group_message(FakeEvent(721, 1001, 999, "哈"))
-        assert scheduled == []
+        assert scheduled == [721], "短消息也必须刷新 quiet timer"
 
     async def test_normal_message_scheduled(self, monkeypatch):
-        monkeypatch.setattr(ambient, "AMBIENT_MIN_MESSAGE_CHARS", 4)
-        scheduled: list[str] = []
+        scheduled: list[int] = []
 
-        def fake_schedule(group_id, chunk):
-            scheduled.append(chunk)
+        def fake_schedule(group_id):
+            scheduled.append(group_id)
 
         monkeypatch.setattr(ambient, "_schedule_decision", fake_schedule)
         await ambient.on_group_message(FakeEvent(722, 1001, 999, "这个 DMA 配置到底怎么弄"))
-        assert scheduled == ["这个 DMA 配置到底怎么弄"]
+        assert scheduled == [722]
 
     async def test_new_message_cancels_previous_debounce(self):
-        ambient._schedule_decision(723, "第一条消息")
+        ambient._schedule_decision(723)
         state = get_group_conversation_state(723)
         first = state.ambient_pending_task
         assert first is not None
-        ambient._schedule_decision(723, "第二条消息")
+        ambient._schedule_decision(723)
         second = state.ambient_pending_task
         assert second is not first
         await asyncio.sleep(0.02)
         assert first.cancelled()
         await _drain_pending(723)
 
+    async def test_long_then_short_resets_timer(self, monkeypatch):
+        """A 长消息 → 8 秒后 B「哈哈」：quiet timer 必须从 B 的时间重新计算。"""
+        scheduled: list[int] = []
+
+        def fake_schedule(group_id):
+            scheduled.append(group_id)
+
+        monkeypatch.setattr(ambient, "_schedule_decision", fake_schedule)
+        await ambient.on_group_message(FakeEvent(724, 1001, 999, "今天老板让我改了五遍"))
+        await ambient.on_group_message(FakeEvent(724, 1002, 999, "哈哈"))
+        assert scheduled == [724, 724], "两条消息各自重置 timer"
+
 
 class TestAfterQuiet:
+    def _long_history(self):
+        return [SimpleNamespace(role="user", content="这个 DMA 配置到底怎么弄")]
+
+    async def test_short_snippet_stays_silent_without_llm(self, monkeypatch):
+        """安静期结束后片段仍是低信息（只有“哈哈”）→ 不调 decision LLM。"""
+        monkeypatch.setattr(ambient, "AMBIENT_MIN_MESSAGE_CHARS", 4)
+        decisions: list = []
+
+        async def fake_history(group_id, limit):
+            return [SimpleNamespace(role="user", content="哈哈")]
+
+        monkeypatch.setattr(ambient, "get_recent_messages", fake_history)
+
+        async def fake_decide(group_id, snippet):
+            decisions.append(snippet)
+            return True
+
+        monkeypatch.setattr(ambient, "_decide", fake_decide)
+        await ambient._after_quiet(731)
+        assert decisions == []
+
     async def test_decision_false_ends_silently(self, monkeypatch):
         monkeypatch.setattr(ambient, "_decide", _async_return(False))
         monkeypatch.setattr(ambient, "_ambient_gate_allows", _async_return(True))
+        monkeypatch.setattr(
+            ambient, "get_recent_messages", _async_return(self._long_history())
+        )
         generated: list = []
 
         async def fake_generate(group_id, chunk):
             generated.append((group_id, chunk))
 
         monkeypatch.setattr(ambient, "_generate_and_send", fake_generate)
-        await ambient._after_quiet(731, "触发片段")
+        await ambient._after_quiet(732)
         assert generated == []
 
     async def test_decision_true_generates(self, monkeypatch):
         monkeypatch.setattr(ambient, "_decide", _async_return(True))
         monkeypatch.setattr(ambient, "_ambient_gate_allows", _async_return(True))
+        monkeypatch.setattr(
+            ambient, "get_recent_messages", _async_return(self._long_history())
+        )
         generated: list = []
 
         async def fake_generate(group_id, chunk):
             generated.append((group_id, chunk))
 
         monkeypatch.setattr(ambient, "_generate_and_send", fake_generate)
-        await ambient._after_quiet(732, "触发片段")
-        assert generated == [(732, "触发片段")]
+        await ambient._after_quiet(733)
+        assert generated == [(733, "这个 DMA 配置到底怎么弄")]
 
     async def test_gate_blocks_before_decision(self, monkeypatch):
         decisions: list = []
         monkeypatch.setattr(ambient, "_ambient_gate_allows", _async_return(False))
+        monkeypatch.setattr(
+            ambient, "get_recent_messages", _async_return(self._long_history())
+        )
 
         async def fake_decide(group_id, chunk):
             decisions.append(group_id)
             return True
 
         monkeypatch.setattr(ambient, "_decide", fake_decide)
-        await ambient._after_quiet(733, "触发片段")
+        await ambient._after_quiet(734)
         assert decisions == []
 
 
