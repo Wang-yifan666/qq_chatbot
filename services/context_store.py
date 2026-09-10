@@ -18,6 +18,9 @@
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 
 from nonebot import logger
 
@@ -160,3 +163,40 @@ async def get_recent_messages(group_id: int, limit: int = 20) -> list[ChatMessag
             redact_secrets(str(exc)),
         )
         return []
+
+
+async def has_recent_bot_message(group_id: int, minutes: int) -> bool:
+    """最近 minutes 分钟内机器人是否在该群发过言（messages 表 role=assistant）。
+
+    供 AMBIENT 冷却与 SCHEDULED skip-if-active 使用：这是“是否该主动说话”的
+    节奏判断，不读取任何用户正文。数据库不可用 / minutes<=0 时返回 False
+    （宁可让上层继续走其它闸门，也不把 DB 故障当成“说过话”）。
+    created_at 由 SQLite CURRENT_TIMESTAMP 生成（UTC），因此与 UTC 截止时间比较。
+    """
+    if minutes <= 0:
+        return False
+    if not await ensure_db():
+        return False
+    conn = db_conn()
+    if conn is None:
+        return False
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    try:
+        cursor = await conn.execute(
+            "SELECT 1 FROM messages "
+            "WHERE group_id = ? AND role = 'assistant' AND created_at >= ? LIMIT 1",
+            (group_id, cutoff),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row is not None
+    except Exception as exc:
+        logger.error(
+            "[CONTEXT] 检查最近机器人发言失败 (group_id={}): {}: {}",
+            group_id,
+            type(exc).__name__,
+            redact_secrets(str(exc)),
+        )
+        return False

@@ -28,5 +28,27 @@ os.environ["SPLIT_REPLY_ENABLED"] = "false"
 os.environ["PERSONA_RAG_ENABLED"] = "false"
 os.environ["WEB_SEARCH_ENABLED"] = "false"
 os.environ["LOG_MESSAGE_CONTENT"] = "false"
+# v0.4 主动行为默认全部关闭：相关测试自行 monkeypatch 模块属性
+os.environ["SCHEDULED_TASKS_ENABLED"] = "false"
+os.environ["MORNING_GREETING_ENABLED"] = "false"
+os.environ["AMBIENT_ENABLED"] = "false"
 os.environ.setdefault("AI_PROVIDER", "deepseek")
 os.environ.setdefault("AI_FALLBACK", "")
+
+
+import pytest_asyncio  # noqa: E402
+
+
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def _close_databases_at_session_end():
+    """session 结束时在同一事件循环上关闭全部 SQLite 连接。
+
+    测试打开过 aiosqlite 连接（懒初始化）且没有逐个关闭；
+    不关的话 aiosqlite 的后台工作会让 pytest 进程在测试全部通过后挂住。
+    """
+    yield
+    from services.database import close_db
+    from services.personal_memory_store import close_memory_db
+
+    await close_db()
+    await close_memory_db()

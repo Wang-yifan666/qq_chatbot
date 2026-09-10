@@ -32,7 +32,6 @@
 """
 
 import asyncio
-import os
 
 from nonebot import logger
 from nonebot import on_message
@@ -48,9 +47,11 @@ from services.affection_store import get_relationship_context
 from services.context_store import CONTEXT_MESSAGE_LIMIT
 from services.context_store import add_message
 from services.context_store import get_recent_messages
-from services.deepseek import ask_deepseek
-from services.deepseek import call_deepseek
 from services.group_access import is_group_allowed
+from services.group_conversation import get_group_conversation_state
+from services.llm_client import AI_PROVIDER
+from services.llm_client import TOOLS
+from services.llm_client import ask_with_fallback
 from services.memory_extractor import extract_memories
 from services.memory_retriever import MEMORY_MAX_CHARS
 from services.memory_retriever import MEMORY_TOP_K
@@ -68,44 +69,12 @@ from services.relationship_service import record_direct_interaction
 from services.reply_splitter import SPLIT_REPLY_DELAY_MS
 from services.reply_splitter import SPLIT_REPLY_ENABLED
 from services.reply_splitter import split_reply
-from services.tool_orchestrator import WEB_SEARCH_TOOL_SCHEMA
-from services.tool_orchestrator import run_with_tools
 from services.user_store import upsert_user
-from services.web_search import WEB_SEARCH_ENABLED
-from services.zhipu import ask_glm
-from services.zhipu import call_glm
-
-# 服务商名 → 对应的调用函数（两家都是 OpenAI 兼容接口，返回格式一致）
-PROVIDER_HANDLERS = {
-    "deepseek": ask_deepseek,
-    "zhipu": ask_glm,
-}
-
-# 服务商名 → 原始调用（返回 content + tool_calls，供 Tool Orchestrator 使用）
-PROVIDER_RAW_HANDLERS = {
-    "deepseek": call_deepseek,
-    "zhipu": call_glm,
-}
-
-# 主服务商与备用服务商（在 .env 中配置，修改后需重启生效）。
-# 支持两种降级：
-# - 跨服务商：AI_PROVIDER=deepseek + AI_FALLBACK=zhipu（或反之）；
-# - 同服务商双模型：AI_PROVIDER=AI_FALLBACK=deepseek，
-#   主模型 = AI_MODEL（或 DEEPSEEK_MODEL 默认），备用模型 = AI_FALLBACK_MODEL。
-AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek").strip().lower()
-AI_FALLBACK = (os.getenv("AI_FALLBACK", "") or "").strip().lower() or None
-# 主模型覆盖（留空 = 用服务商默认模型 DEEPSEEK_MODEL / ZHIPU_MODEL）
-AI_MODEL = (os.getenv("AI_MODEL", "") or "").strip() or None
-# 备用模型覆盖（留空 = 用备用服务商默认模型；同服务商降级时必填）
-AI_FALLBACK_MODEL = (os.getenv("AI_FALLBACK_MODEL", "") or "").strip() or None
 
 # 记忆提取的最小问题长度（太短的寒暄不值得多花一次 LLM 调用）
 _MEMORY_EXTRACT_MIN_LEN = 6
 # 记忆提取单次调用超时（秒），超时放弃，不影响回复
 _MEMORY_EXTRACT_TIMEOUT = 20.0
-
-# 本进程的可用工具（由程序根据 WEB_SEARCH_ENABLED 决定，聊天内容不能修改）
-TOOLS = [WEB_SEARCH_TOOL_SCHEMA] if WEB_SEARCH_ENABLED else None
 
 # 消息事件匹配器：
 # - rule=to_me()：只有 @机器人（或回复机器人）的消息才进入本处理器
@@ -113,79 +82,10 @@ TOOLS = [WEB_SEARCH_TOOL_SCHEMA] if WEB_SEARCH_ENABLED else None
 # - block=True：处理完后不再交给后续低优先级处理器（context_recorder 不重复保存）
 chat = on_message(rule=to_me(), priority=10, block=True)
 
-# 同一群的 @ 处理串行（不同群互不阻塞）。
+# 同一群的 @ 处理串行（不同群互不阻塞）：锁来自 services/group_conversation.py，
+# DIRECT / AMBIENT / SCHEDULED 三种模式共用同一把 per-group 锁。
 # 两个 @ 问题同时到达时，若完全并行，问题 2 读 Context 时可能还没看到问题 1 的
-# 机器人回答；per-group 锁保证同群处理顺序稳定。锁按需创建，dict 操作无 await、
-# 在事件循环内原子，不需要额外的保护锁。
-_group_locks: dict[int, asyncio.Lock] = {}
-
-
-def _get_group_lock(group_id: int) -> asyncio.Lock:
-    """获取某个群专用的锁；首次访问时创建。"""
-    lock = _group_locks.get(group_id)
-    if lock is None:
-        lock = _group_locks[group_id] = asyncio.Lock()
-    return lock
-
-
-async def _ask(
-    provider: str,
-    messages: list[dict[str, str]],
-    model: str | None = None,
-) -> str | None:
-    """按服务商名调用对应的 AI 服务；model=None 时使用服务商默认模型。"""
-    return await PROVIDER_HANDLERS[provider](messages, model)
-
-
-async def _ask_raw(
-    provider: str,
-    messages: list[dict],
-    model: str | None = None,
-    tools: list[dict] | None = None,
-):
-    """按服务商名调用原始接口（返回 RawCompletion | None，供工具编排使用）。"""
-    return await PROVIDER_RAW_HANDLERS[provider](messages, model, tools)
-
-
-async def _ask_with_fallback(
-    messages: list[dict[str, str]],
-    tools: list[dict] | None = None,
-) -> tuple[str | None, str]:
-    """主 Provider（主模型）→ 失败用完全相同的 messages 降级备用（备用模型）。
-
-    返回 (answer, 实际使用的 provider)。同服务商双模型降级时，
-    主备都指向同一 provider，但分别使用 AI_MODEL 与 AI_FALLBACK_MODEL。
-    tools 不为 None 时启用工具编排（主备各自独立编排，工具输出不可信 DATA）。
-    """
-    used_provider = AI_PROVIDER
-    if tools:
-        answer = await run_with_tools(
-            lambda msgs, t=None: _ask_raw(AI_PROVIDER, msgs, AI_MODEL, t),
-            messages,
-            tools,
-        )
-    else:
-        answer = await _ask(AI_PROVIDER, messages, AI_MODEL)
-
-    if not answer and AI_FALLBACK:
-        logger.warning(
-            "[AI CHAT] 主服务商 {} 调用失败，降级到 {} 重试"
-            "（主模型 {}，备用模型 {}）",
-            AI_PROVIDER,
-            AI_FALLBACK,
-            AI_MODEL or "默认",
-            AI_FALLBACK_MODEL or "默认",
-        )
-        used_provider = AI_FALLBACK
-        if tools:
-            answer = await run_with_tools(
-                lambda msgs, t=None: _ask_raw(AI_FALLBACK, msgs, AI_FALLBACK_MODEL, t),
-                messages,
-                tools,
-            )
-        else:
-            answer = await _ask(AI_FALLBACK, messages, AI_FALLBACK_MODEL)
-    return answer, used_provider
+# 机器人回答；per-group 锁保证同群处理顺序稳定。
 
 
 @chat.handle()
@@ -248,10 +148,11 @@ async def handle(event: GroupMessageEvent):
 async def _answer(event: GroupMessageEvent, question: str) -> str:
     """用户状态 → 旧 Context → 保存问题 → 记忆/关系 → 构造 Prompt → 调模型 → 保存。
 
-    整个流程持本群专用锁执行：同一群的 @ 问题串行处理；不同群锁相互独立，互不阻塞。
+    整个流程持本群专用锁执行（与 AMBIENT / SCHEDULED 共用同一把锁）：
+    同一群的 @ 问题串行处理；不同群锁相互独立，互不阻塞。
     返回要发给群里的最终文本（成功回答 / 统一的服务不可用提示）。
     """
-    async with _get_group_lock(event.group_id):
+    async with get_group_conversation_state(event.group_id).lock:
         user_id = event.user_id
         group_id = event.group_id
         nickname = sender_display_name(event)
@@ -358,8 +259,8 @@ async def _answer(event: GroupMessageEvent, question: str) -> str:
             persona_refs=persona_refs,
         )
 
-        # 9. 主备调用（同一 messages）
-        answer, used_provider = await _ask_with_fallback(messages, TOOLS)
+        # 9. 主备调用（同一 messages；DIRECT 模式按 WEB_SEARCH_ENABLED 决定工具）
+        answer, used_provider = await ask_with_fallback(messages, TOOLS)
 
         if not answer:
             # 两个服务商都失败时，不把任何异常细节或 API Key 发到群里
@@ -400,7 +301,7 @@ async def _extract_memories_in_background(
     """
 
     async def _extract_ask(messages: list[dict[str, str]]) -> str | None:
-        text, _ = await _ask_with_fallback(messages)
+        text, _ = await ask_with_fallback(messages)
         return text
 
     try:

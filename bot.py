@@ -168,7 +168,29 @@ elif not ALLOWED_GROUP_IDS:
 else:
     logger.info("[GROUP ACCESS] allowed groups configured: {}", len(ALLOWED_GROUP_IDS))
 
-# 7. 加载 plugins/ 目录下的全部插件（ai_chat / context_recorder）。
+# 6.6 定时任务（v0.4）：加载官方生态的 APScheduler 插件，再校验 + 注册 Scheduled Task。
+#     MORNING_GREETING_TIME / MORNING_GREETING_GROUP_IDS 等非法配置在启动阶段
+#     ValueError → 明确报错退出（与白名单校验同一原则）。
+try:
+    nonebot.load_plugin("nonebot_plugin_apscheduler")
+except Exception as exc:
+    logger.error(
+        "[SCHEDULED] 加载 nonebot_plugin_apscheduler 失败（请先执行 "
+        "pip install -r requirements.txt）：{}: {}",
+        type(exc).__name__,
+        redact_secrets(str(exc)),
+    )
+    sys.exit(1)
+
+try:
+    from services.scheduled_tasks import setup_scheduled_tasks
+except ValueError as exc:
+    logger.error("[SCHEDULED] {}", redact_secrets(str(exc)))
+    sys.exit(1)
+
+setup_scheduled_tasks(driver)
+
+# 7. 加载 plugins/ 目录下的全部插件（ai_chat / context_recorder / ambient）。
 nonebot.load_plugins("plugins")
 
 

@@ -2,19 +2,24 @@
 
 一个运行在 Windows 上的 QQ 群聊 AI 机器人。
 
-**当前版本：v0.3.1 —— 群聊访问白名单（`ALLOWED_GROUP_IDS`，fail-closed 静态白名单）**
+**当前版本：v0.4 —— 主动行为双触发系统（Scheduled 定时任务 + AMBIENT 自然插话，Persona 单一来源）**
 
 ```
-群里 @机器人 你的问题  →  ① 群访问白名单（fail-closed：非白名单群到此为止，不读/不存/不回）
-                        →  程序生成可信状态（current_user_id / relationship / 日期时间 / capabilities）
-                        →  上下文 DATA（JSON 转义：昵称 / 记忆 / 结构化群聊历史，带 Context Budget）
-                        →  Persona RAG：角色语料 → 本地 NumPy 索引 → 动态过滤 → 检索 →
-                           rerank → diversity → 风格参考注入 SYSTEM（失败自动降级）
-                        →  固定人格 + 安全规则 + 信任模型 + 人格锚点
-                        →  需要时调用 web_search 工具（真实联网，白名单 + Schema 校验）
-                        →  DeepSeek / 智谱 GLM（失败自动 fallback，同一 messages）
-                        →  按自然段拆成多条 QQ 消息回复（防刷屏）
-                        →  完整回答只存入 SQLite 一次
+触发源 A：QQ Message Event                      触发源 B：APScheduler Cron（不依赖任何消息）
+  ├─ @夜子 / 回复 → DIRECT（原 ai_chat 流程）       └─ morning_greeting 等 ScheduledTask
+  └─ 普通群消息 → AMBIENT（安静期+闸门+AI 决策）         → 白名单 → per-group 锁 → claim 幂等
+                    ↓                                       ↓
+        统一 Conversation Generation Pipeline
+        ① 群访问白名单（fail-closed：非白名单群到此为止，不读/不存/不回）
+        ② 唯一 Persona Core（本地 persona.txt / PERSONA_FILE，三模式共用）
+        ③ 程序生成可信状态（conversation_mode / 日期时间 / capabilities）
+        ④ 上下文 DATA（JSON 转义，带 Context Budget）
+        ⑤ Persona RAG：角色语料 → 本地 NumPy 索引 → 动态过滤 → 检索 →
+           rerank → diversity → 风格参考注入 SYSTEM（失败自动降级）
+        ⑥ 安全规则 + 信任模型 + 人格锚点
+        ⑦ 需要时调用 web_search 工具（白名单 + Schema 校验；Scheduled/AMBIENT 默认无工具）
+        ⑧ DeepSeek / 智谱 GLM（失败自动 fallback，同一 messages）
+        ⑨ 主动模式：QQ 主动发送 → assistant 写入 Context；DIRECT：按自然段拆分回复
 ```
 
 机器人能理解“这个”“那个”“刚才说的”“你刚才第二点是什么意思”“继续说”这类
@@ -32,17 +37,14 @@
 ## 数据流
 
 ```
-QQ群成员发消息（普通消息或 @机器人）
-  ↓
-QQ 服务器
-  ↓
-NapCat（机器人账号在线，把 QQ 消息转成 OneBot 11 协议）
-  ↓
-反向 WebSocket：NapCat 主动连接 NoneBot2（ws://127.0.0.1:8080/onebot/v11/ws）
-  ↓
-NoneBot2（FastAPI 驱动，监听 127.0.0.1:8080）
-  ↓
-群访问白名单 services/group_access.py（fail-closed）
+触发源 A：QQ 消息                                       触发源 B：Scheduler（v0.4）
+QQ群成员发消息（普通消息或 @机器人）                    APScheduler cron 到点（BOT_TIMEZONE）
+  ↓                                                       ↓
+QQ 服务器 / NapCat（OneBot 11 协议）                     morning_greeting job（无 GroupMessageEvent）
+  ↓                                                       ↓
+反向 WebSocket → NoneBot2（FastAPI，127.0.0.1:8080）      白名单 → 今日任务状态（claim 幂等）
+  ↓                                                       ↓
+群访问白名单 services/group_access.py（fail-closed）  ←— 白名单检查同样适用于主动发送
   ├─ 未授权群：直接丢弃（不回复 / 不记录 / 不调用 AI / 不写任何数据库）
   └─ 授权群 ↓
 ├─ plugins/debug.py（priority=1, block=True，\\debug 开头即触发，无需 @）
@@ -53,23 +55,29 @@ NoneBot2（FastAPI 驱动，监听 127.0.0.1:8080）
 │     白名单群纯文本消息 → context_store 写入 SQLite（data/chat_history.db）
 │     同时 upsert 用户身份（users 表）；只记录，不回复，不调用 AI
 │
-└─ plugins/ai_chat.py（priority=10, block=True，只有 @机器人 才触发）
-      ⓪ 群访问白名单检查：未授权群直接丢弃（不回复、不调 AI、不落库）
-      ① upsert 用户身份（user_id 稳定身份，nickname 只是显示名）
-      ② 读同群最近 N 条历史（旧 Context）
-      ③ 保存当前问题（role=user）
-      ④ 读该用户本群长期记忆（user_memories，user_id + group_id 双重隔离）
-      ⑤ 计算有效关系（close 运行时派生，唯一来源 CLOSE_USER_ID）
-      ⑥ 从最近群聊提取参与者 → Relationship Context（affection 亲近倾向，多人偏向）
-      ⑦ Mini-RAG：memory_retriever 检索本群个人资料（失败降级为无记忆对话）
-      ⑧ services/prompt_builder.py 构造一次 messages
-         （人格 + 可信状态[用户/关系/记忆] + 亲近倾向 + Personal Memory + 群聊上下文 + 当前问题）
-      ⑨ services/deepseek.py 或 services/zhipu.py（纯 LLM Transport，
-         AsyncOpenAI 异步调用；主失败用完全相同的 messages 降级备用）
-      ⑩ 保存机器人回答（role=assistant）
-      ⑪ 有效互动计数原子 +1（重算 base_level；close 用户同样计数）
-      ⑫ 后台异步 LLM 提取长期记忆（失败只记日志，不阻塞回复）
-      ⑬ 回答沿原路返回 → NoneBot2 → WebSocket → NapCat → QQ群回复
+├─ plugins/ambient.py（priority=30，v0.4 自然插话，默认关闭）
+│     普通消息 → 安静期 debounce → cheap gate（太短/冷却/每小时上限）
+│     → LLM 决策 {"should_reply": bool}（允许沉默）→ 主动生成 → 发送 → 写 Context
+│
+├─ plugins/ai_chat.py（priority=10, block=True，只有 @机器人 才触发）
+│     ⓪ 群访问白名单检查：未授权群直接丢弃（不回复、不调 AI、不落库）
+│     ① upsert 用户身份（user_id 稳定身份，nickname 只是显示名）
+│     ② 读同群最近 N 条历史（旧 Context）
+│     ③ 保存当前问题（role=user）
+│     ④ 读该用户本群长期记忆（user_memories，user_id + group_id 双重隔离）
+│     ⑤ 计算有效关系（close 运行时派生，唯一来源 CLOSE_USER_ID）
+│     ⑥ 从最近群聊提取参与者 → Relationship Context（affection 亲近倾向，多人偏向）
+│     ⑦ Mini-RAG：memory_retriever 检索本群个人资料（失败降级为无记忆对话）
+│     ⑧ services/prompt_builder.py 构造一次 messages
+│        （人格 + 可信状态[用户/关系/记忆] + 亲近倾向 + Personal Memory + 群聊上下文 + 当前问题）
+│     ⑨ services/llm_client.py 统一 Provider/fallback（主失败用完全相同的 messages 降级备用）
+│     ⑩ 保存机器人回答（role=assistant）
+│     ⑪ 有效互动计数原子 +1（重算 base_level；close 用户同样计数）
+│     ⑫ 后台异步 LLM 提取长期记忆（失败只记日志，不阻塞回复）
+│     ⑬ 回答沿原路返回 → NoneBot2 → WebSocket → NapCat → QQ群回复
+│
+└─ 三种模式共用：per-group 锁（services/group_conversation.py）+
+   唯一 Persona Core（prompt_builder.CORE_PERSONA ← 本地 persona.txt）
 ```
 
 ## 群聊访问白名单（v0.3.1）
@@ -118,6 +126,47 @@ NoneBot2（FastAPI 驱动，监听 127.0.0.1:8080）
 
 - 白名单修改后**重启 Bot 生效**。本阶段不做群管理员命令、动态增删、SQLite 群配置表、
   Web 管理后台、黑名单、用户白名单、私聊权限、.env 热加载。
+
+## 主动行为（v0.4）：两个完全不同的触发系统
+
+“为什么这次需要说话”和“夜子应该说什么”是两件不同的事：
+Scheduler / 事件只决定**是否触发**；**怎么说**永远由本地人格文件
+（`persona.txt`，或 `PERSONA_FILE` 指定）这一唯一来源决定。
+
+- **DIRECT**（触发源 A：@/回复，保持 v0.3.1 行为）：现有 `plugins/ai_chat.py` 流程，
+  优先级最高，本版本行为完全不变；
+- **SCHEDULED**（触发源 B：真实 Cron，不依赖任何 QQ 消息）：`nonebot-plugin-apscheduler`
+  的 `AsyncIOScheduler` + `CronTrigger(hour, minute, timezone=BOT_TIMEZONE)`；
+  第一版只有 `morning_greeting` 一个任务（通用 `ScheduledTask` 抽象：
+  task_id / trigger / target_groups / enabled / event_type，后续可加 night/birthday 等，
+  本版本不提前实现）。执行链路：白名单 → 共享 per-group 锁 →
+  `scheduled_task_runs` 原子 claim（`UNIQUE(task_id, group_id, scheduled_date)`，
+  每天每群最多一次，重启/多实例/08:05 重启都不重复）→ skip-if-active →
+  Persona RAG 风格参考 → `conversation_mode=scheduled`（无 current_user、
+  无伪造记忆）→ 统一 LLM 调用（**默认无工具**）→ 主动 `send_group_msg` →
+  完整内容以 role=assistant 写入 Context → 更新执行状态；支持启动 catch-up
+  （08:10 启动且窗口 30 分钟内补一次，10:30 启动不补）；
+- **AMBIENT**（触发源 A：普通群消息，自然插话 MVP）：`plugins/ambient.py`
+  （priority=30，晚于 context_recorder）→ 群里安静 `AMBIENT_QUIET_SECONDS` 秒
+  → cheap gate（消息太短 / `AMBIENT_COOLDOWN_MINUTES` 冷却 / 每小时
+  `AMBIENT_MAX_PER_HOUR` 次上限，全部不调用 LLM）→ LLM 决策
+  （严格 JSON `{"should_reply": bool}`，**允许什么都不说**，解析失败按不说话）
+  → 通过才进入 `conversation_mode=ambient` 生成管线 → 主动发送 → 写 Context。
+  绝不每条普通消息都回复、没有“每 N 条随机说一次”；
+- **三种模式共用同一个 Persona Core**（`prompt_builder.CORE_PERSONA`，唯一读取
+  `persona.txt` 的地方），共用 `services/group_conversation.py` 的 per-group 锁与
+  `services/llm_client.py` 的统一 Provider/fallback。Persona RAG 永远只是表达参考，
+  不能覆盖本地 Persona Core；本地人格与内置默认冲突时以本地人格为准（修改后重启生效）。
+
+**新增一个定时任务（三步）**：`services/scheduled_tasks.py` 的
+`SCHEDULED_TASK_SPECS` 注册表加一行 `TaskSpec(prefix/task_id/event_type/
+default_time/allow_tools)` → `services/prompt_builder.py` 的
+`SCHEDULED_EVENT_INSTRUCTIONS` 加一句对应 event_type 的任务事实指令（只描述事实，
+不写性格）→ 可选在 `EVENT_QUERY_TEXTS` 加 Persona RAG 检索 seed。执行、白名单、
+per-group 锁、claim 幂等、catch-up、skip-if-active、Persona 单一来源全部由
+`execute_scheduled_task()` 自动复用；`.env` 变量名约定为
+`{PREFIX}_ENABLED / {PREFIX}_TIME / {PREFIX}_GROUP_IDS / {PREFIX}_CATCHUP_MINUTES /
+{PREFIX}_SKIP_IF_ACTIVE_MINUTES`（非法时间启动报错退出）。
 
 ## 功能范围
 
@@ -195,6 +244,28 @@ NoneBot2（FastAPI 驱动，监听 127.0.0.1:8080）
 - API 异常兜底：主备都失败时回复「AI 服务暂时不可用，请稍后再试。」，Bot 不崩溃
 - 数据库异常降级：SQLite 读写失败只记日志，Bot 退化为单轮问答继续运行
 - 启动时缺少所用服务商的 API Key（`DEEPSEEK_API_KEY` / `ZHIPU_API_KEY`）直接报错退出，而不是运行中才报错
+- **主动行为双触发系统（v0.4）**：
+  - `conversation_mode = direct | ambient | scheduled` 统一由 `prompt_builder` 构造；
+    direct 输出与 v0.3.1 完全一致；ambient/scheduled 没有 current_user / current_question，
+    只有可信触发事件与（可选）最近群聊上下文 DATA；
+  - **唯一 Persona Core**：`prompt_builder.CORE_PERSONA` 是唯一读取
+    `PERSONA_FILE`（默认本地 `persona.txt`）的地方，三种模式共用，代码不硬编码任何
+    性格形容词、不复制人格 Prompt、不维护固定早安文案；Persona RAG 只作表达参考，
+    永远不覆盖 Persona Core；
+  - **Scheduled**：`nonebot-plugin-apscheduler` 真实 Cron（`BOT_TIMEZONE` 时区，
+    非法 `MORNING_GREETING_TIME` 启动报错退出）；通用 `ScheduledTask` 抽象，
+    第一版只实现 `morning_greeting`；`scheduled_task_runs` 表
+    `UNIQUE(task_id, group_id, scheduled_date)` 原子 claim（每天每群最多一次，
+    重启 / 多实例 / 08:05 重启都不重复，宁可少一次不重复发）；启动 catch-up 窗口；
+    `MORNING_GREETING_SKIP_IF_ACTIVE_MINUTES` 最近说过话则跳过；默认无工具；
+    发送成功后完整内容以 role=assistant 写入 Context（随后“你刚刚说什么”能接上）；
+  - **AMBIENT（MVP）**：普通消息 → 安静期 debounce → cheap gate（太短 / 冷却 /
+    每小时上限，全部不调 LLM）→ 决策 `{"should_reply": bool}`（允许沉默，
+    解析失败按沉默）→ 通过才进入统一生成管线 → 主动发送 → 写 Context；
+    绝不对每条普通消息回复，没有随机“每 N 条说一次”；
+  - 三种模式共用 `services/group_conversation.py` 的 per-group 锁（DIRECT > AMBIENT，
+    Scheduled 到点后等锁、拿到锁再确认）与 `services/llm_client.py` 的统一
+    Provider / fallback；白名单（fail-closed）对主动发送同样生效。
 
 暂不实现（保持范围小）：
 
@@ -206,7 +277,8 @@ NoneBot2（FastAPI 驱动，监听 127.0.0.1:8080）
   无独立向量数据库服务）
 - 自动从普通聊天中学习个人信息（个人资料只能由管理员 `\debug memory set` 显式写入）
 - 用户画像自动总结 / 自动总结全部群聊
-- 自动插话 / 关键词唤醒
+- 天气早安 / 每日新闻 / 随机主动私聊 / 心情系统 / 行为树 / 多个 Cron 管理 UI /
+  动态编辑任务 / 数据库存完整 Cron 配置（v0.4 只做 morning_greeting 一个任务）
 - 通用 Agent / 多工具编排（当前只有白名单内的 `web_search` 一个工具）
 - 图片理解 / 图片 RAG
 - 私聊 AI
@@ -240,10 +312,16 @@ qq_ai_bot/
 │   ├── persona_processed/ # 标注语料（自备，版权数据，禁止提交，只读）
 │   └── persona_rag/       # 机器生成索引：embeddings.npy + metadata.jsonl + index_config.json
 │
-├── tests/                 # pytest 测试基线（v0.3.1；纯逻辑 + mock，不连 QQ / 真实 API）
-│   ├── conftest.py            # 隔离环境：临时 SQLite 路径 + 关闭 RAG/拆分/搜索
+├── tests/                 # pytest 测试基线（v0.3.1 起；纯逻辑 + mock，不连 QQ / 真实 API）
+│   ├── conftest.py            # 隔离环境：临时 SQLite 路径 + 关闭 RAG/拆分/搜索/主动行为
 │   ├── test_group_access.py   # 白名单解析 + fail-closed 语义 + 非法配置导入报错
-│   ├── test_group_gate.py     # 未授权群零副作用 / 授权群正常流程（伪事件 + 桩 Provider）
+│   ├── test_group_gate.py     # 未授权群零副作用 / 授权群正常流程 / ambient 门禁 / cron 注册
+│   ├── test_group_conversation.py  # 三模式共享 per-group 锁 + AMBIENT 频率状态（v0.4）
+│   ├── test_prompt_builder_modes.py # direct 不变 + scheduled/ambient 结构 + Persona 单一来源（v0.4）
+│   ├── test_scheduled_config.py    # MORNING_GREETING_TIME 解析 / catch-up 窗口 / 非法配置报错（v0.4）
+│   ├── test_scheduled_task_store.py# claim 幂等 + 状态更新 + has_recent_bot_message（v0.4）
+│   ├── test_scheduled_execution.py # morning_greeting 全流程（mock）：幂等/离线/跳过/锁（v0.4）
+│   ├── test_ambient.py            # 决策解析 / 闸门 / 防抖 / ambient 生成管线（v0.4）
 │   ├── test_reply_splitter.py # 回复拆分（短文本 / 段落 / 代码块 / 上限 / 极端输入）
 │   ├── test_tool_orchestrator.py  # web_search 参数校验 + 工具白名单 + 次数/轮数上限（mock 搜索）
 │   └── test_relationship_service.py # calculate_base_level 阈值（永不产生 close）
@@ -261,15 +339,22 @@ qq_ai_bot/
 ├── plugins/
 │   ├── __init__.py
 │   ├── debug.py           # \debug 管理员命令（priority=1, block=True，白名单鉴权）
-│   ├── ai_chat.py         # @机器人 处理：群白名单 → 读历史 → 检索记忆 → Persona RAG →
-│   │                      #   构造 Prompt → 调模型（主备）→ 存回答 → 回复；per-group 锁
-│   └── context_recorder.py# 记录白名单群纯文本消息（priority=20, 不回复）
+│   ├── ai_chat.py         # DIRECT：@机器人 处理：群白名单 → 读历史 → 检索记忆 → Persona RAG →
+│   │                      #   构造 Prompt → 统一 LLM 层（主备）→ 存回答 → 回复；共享 per-group 锁
+│   ├── context_recorder.py# 记录白名单群纯文本消息（priority=20, 不回复）
+│   └── ambient.py         # AMBIENT（v0.4，priority=30）：普通消息 → services/ambient.py 调度
 │
 └── services/
-    ├── __init__.py            # redact_secrets：日志密钥脱敏
+    ├── __init__.py            # redact_secrets + 日志隐私开关（v0.3.1）
     ├── group_access.py        # 群聊访问白名单：ALLOWED_GROUP_IDS 解析 + is_group_allowed（v0.3.1）
-    ├── database.py            # SQLite 唯一入口：连接 + 全部建表/索引（WAL）
-    ├── context_store.py       # messages：群聊短期上下文读写
+    ├── group_conversation.py  # 群会话共享状态：DIRECT/AMBIENT/SCHEDULED 共用 per-group 锁（v0.4）
+    ├── llm_client.py          # 统一 LLM 调用层：Provider/fallback/工具编排（三模式共用，v0.4）
+    ├── proactive_sender.py    # 主动发送：OneBot Bot 查找 + send_group_msg + assistant 入库（v0.4）
+    ├── scheduled_tasks.py     # ScheduledTask 抽象 + morning_greeting cron + catch-up（v0.4）
+    ├── scheduled_task_store.py# scheduled_task_runs：原子 claim / 状态更新（幂等，v0.4）
+    ├── ambient.py             # AMBIENT：debounce + cheap gate + 决策 + ambient 生成管线（v0.4）
+    ├── database.py            # SQLite 唯一入口：连接 + 全部建表/索引（含 scheduled_task_runs，WAL）
+    ├── context_store.py       # messages：群聊短期上下文读写 + has_recent_bot_message
     ├── user_store.py          # users：用户身份（user_id 稳定身份）
     ├── relationship_service.py# relationships：关系计数/升级 + CLOSE_USER_ID + close 派生
     ├── memory_store.py        # user_memories：LLM 提取的长期记忆（user+group 双隔离）
@@ -278,13 +363,13 @@ qq_ai_bot/
     ├── memory_retriever.py   # Mini-RAG 检索：规则评分 + Memory Context 格式化
     ├── affection_store.py    # 好感度存取 + Relationship Context 构造（v0.2.6）
     ├── runtime_context.py    # 可信运行时状态：日期/时间/时区（v0.2.3）
-    ├── context_serializer.py # 结构化 JSON 历史 + Context Budget（v0.2.3）
+    ├── context_serializer.py # 结构化 JSON 历史 + Context Budget + 无提问者的群历史 DATA（v0.4）
     ├── web_search.py         # 联网搜索后端（bing / duckduckgo，统一接口）（v0.2.3）
     ├── tool_orchestrator.py  # 工具白名单 + Schema 校验 + 调用循环（v0.2.3）
     ├── reply_splitter.py     # 自然段拆分回复（防刷屏）（v0.2.3）
     ├── embedding_backend.py  # 可替换 EmbeddingBackend + 进程级单例（模型只加载一次）（v0.3.0）
     ├── persona_rag.py        # Persona RAG：过滤/检索/rerank/diversity → PersonaReference（v0.3.0）
-    ├── prompt_builder.py      # 人格 + 安全规则 + 信任模型 + 运行时状态 + build_messages()
+    ├── prompt_builder.py      # 唯一 Persona Core 来源 + 安全规则 + conversation_mode 构造（v0.4）
     ├── deepseek.py            # DeepSeek 纯 LLM Transport + ask_deepseek(messages)
     └── zhipu.py               # 智谱 GLM 纯 LLM Transport + ask_glm(messages)
 ```
@@ -440,6 +525,39 @@ ONEBOT_ACCESS_TOKEN=
 # 完整搜索 query / Persona 台词，只记 question_chars / 检索条数 / 命令名等 metadata。
 # true 仅供本地开发调试：日志才可能包含经脱敏 + 截断的消息正文；非法值安全回落 false。
 LOG_MESSAGE_CONTENT=false
+
+# ===== Scheduled tasks (v0.4, nonebot-plugin-apscheduler) =====
+# 定时任务总开关（默认 false）。Scheduler 只决定“什么时候说”，
+# “怎么说”永远由本地 persona.txt（Persona Core）决定，代码不存固定早安文案。
+SCHEDULED_TASKS_ENABLED=false
+# 本版本唯一任务：早上主动问候（默认 false）
+MORNING_GREETING_ENABLED=false
+# cron 触发时刻：HH:MM，使用 BOT_TIMEZONE（不是系统时区）；非法值启动报错退出
+MORNING_GREETING_TIME=08:00
+# 目标群（逗号分隔；空 = 无目标；* = 全部白名单群；非白名单群永远不发）
+MORNING_GREETING_GROUP_IDS=
+# 启动 catch-up 窗口（分钟，0=关闭，默认 30）：08:10 启动会补一次，10:30 启动不补
+MORNING_GREETING_CATCHUP_MINUTES=30
+# 最近 N 分钟内已发言则跳过（分钟，0=关闭，默认 10）；只影响是否执行，不影响人格
+MORNING_GREETING_SKIP_IF_ACTIVE_MINUTES=10
+# 晚间问候任务（同样的任务模式，默认关闭；Scheduler 决定何时说，Persona 决定怎么说）
+# NIGHT_GREETING_ENABLED=false
+# NIGHT_GREETING_TIME=21:00
+# NIGHT_GREETING_GROUP_IDS=
+# NIGHT_GREETING_CATCHUP_MINUTES=30
+# NIGHT_GREETING_SKIP_IF_ACTIVE_MINUTES=10
+
+# ===== AMBIENT proactive chat (v0.4, 消息事件触发，默认关闭) =====
+# 没有被 @ 时偶尔自然插话：安静期 + 冷却 + 每小时上限 + AI 决策（允许不说话）
+AMBIENT_ENABLED=false
+# 群里安静多少秒后才考虑插话（1~60，默认 10）
+AMBIENT_QUIET_SECONDS=10
+# 最近 N 分钟内机器人已发言则冷却不插话（1~240，默认 30）
+AMBIENT_COOLDOWN_MINUTES=30
+# 每群每小时最多插话次数（0~20，默认 3；0 = 完全关闭插话）
+AMBIENT_MAX_PER_HOUR=3
+# 触发消息少于多少字直接忽略（1~200，默认 4）
+AMBIENT_MIN_MESSAGE_CHARS=4
 
 # ===== Persona RAG (v0.3.0, NumPy 本地索引，无向量数据库) =====
 # 角色人格语料检索开关
@@ -1015,9 +1133,30 @@ python -m compileall bot.py plugins services scripts tests
 - `test_group_access.py`：白名单解析（空 / `*` / 单个 / 多个 / 空格 / 空段 / 重复 /
   `0` / 负数 / 非数字 / 混合非法项）、fail-closed 语义、非法配置在导入期抛 `ValueError`
   （对应启动报错退出）；
-- `test_group_gate.py`：构造伪 OneBot 事件直接调用三个插件的 handler——未授权群
+- `test_group_gate.py`：构造伪 OneBot 事件直接调用各插件的 handler——未授权群
   不读取消息正文、不回复、不调用 AI、不写 `messages` / `users` / `relationships` /
-  `user_memories`；授权群正常进入流程（AI 层用桩替代）；
+  `user_memories`；授权群正常进入流程（AI 层用桩替代）；ambient 插件门禁；
+  morning_greeting cron 真实注册（trigger=08:00 Asia/Shanghai、coalesce、
+  max_instances=1、misfire_grace_time）；
+- `test_group_conversation.py`（v0.4）：DIRECT / AMBIENT / SCHEDULED 共享同一把
+  per-group 锁（拿到锁的第二个协程必须等待）与 AMBIENT 频率状态；
+- `test_prompt_builder_modes.py`（v0.4）：direct 输出与旧版完全一致；
+  scheduled / ambient 无 current_user、无伪造提问者；本地 `persona.txt` 就是
+  `CORE_PERSONA`（Persona 单一来源），三种模式共用；定时/插话指令不含
+  “活泼/傲娇/毒舌/可爱/温柔”等硬编码性格；
+- `test_scheduled_config.py`（v0.4）：`MORNING_GREETING_TIME` 解析（08:00 合法，
+  24:00 等非法启动报错）、catch-up 窗口（07:59 不触发 / 08:10 补执行 /
+  10:30 不补 / 时区正确）；
+- `test_scheduled_task_store.py`（v0.4）：claim 幂等（同任务同群同天第二次失败）、
+  不同群 / 不同天 / 不同任务相互独立、任何终态都阻止重试、`has_recent_bot_message`；
+- `test_scheduled_execution.py`（v0.4）：morning_greeting 全流程（mock）——
+  未授权群永远不发、成功链路（无工具 / 无 current_user / assistant 写 Context /
+  状态 success）、08:00 执行后重启（第二次同天执行 → claimed 跳过）、多群独立、
+  skip-if-active、Bot 离线 / Provider 失败 / 发送失败 → failed 不崩溃、
+  DIRECT 持锁时 Scheduled 等待；
+- `test_ambient.py`（v0.4）：决策 JSON 解析（垃圾输入按不说话）、决策 Prompt 结构、
+  cheap gate（每小时上限 / 冷却 / 关闭）、太短消息不调度、防抖重排取消旧任务、
+  决策 false 全程沉默、ambient 生成管线（无工具 / 无 current_user / 发送后写 Context）；
 - `test_reply_splitter.py`：短文本不拆 / 自然段拆分 / max chars / max parts /
   代码块不拆坏 / 空与极端输入；
 - `test_tool_orchestrator.py`：web_search 参数校验（非 JSON / query 非字符串 / 空 /
@@ -1206,6 +1345,18 @@ python scripts/test_group_access.py
 **Q：控制台里中文乱码？**
 程序已强制 stdout/stderr 用 UTF-8。如果你用的是很老的 CMD/conhost，先执行 `chcp 65001`。
 使用 Windows Terminal 则无需处理。
+
+**Q：更新到 v0.4 后怎么没有早上问候 / 不会主动插话？**
+这是设计行为：`SCHEDULED_TASKS_ENABLED` / `MORNING_GREETING_ENABLED` / `AMBIENT_ENABLED`
+默认全部为 `false`（fail-closed）。按需在 `.env` 开启，并填写
+`MORNING_GREETING_TIME` / `MORNING_GREETING_GROUP_IDS` 等，重启生效。
+定时任务使用 `BOT_TIMEZONE` 时区（不是系统时区）；每天每群最多发送一次，
+Bot 在任务时间前离线、又在 catch-up 窗口内（默认 30 分钟）启动时会补一次。
+
+**Q：早上问候会说什么？**
+由本地 `persona.txt`（Persona Core）决定，代码里没有任何固定早安文案。
+模型按「人格 + 当前可信时间 + conversation_mode=scheduled + 可选最近群聊上下文」
+自己生成，不虚构昨晚互动；`PERSONA_RAG` 只是风格参考，不能覆盖本地人格。
 
 **Q：为什么 requirements.txt / .env 的注释是英文？**
 中文 Windows 的默认编码是 GBK，旧版 pip 会按 GBK 读 requirements.txt，UTF-8 中文注释会报

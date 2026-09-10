@@ -24,6 +24,10 @@ aiosqlite>=0.19.0
 # Loads the .env file into environment variables
 python-dotenv>=1.0.0
 
+# ===== Scheduled tasks (v0.4) =====
+# NoneBot official APScheduler plugin: real cron + timezone for morning_greeting
+nonebot-plugin-apscheduler>=0.5.0
+
 # ===== Timezone database (Windows) =====
 # Python on Windows has no built-in IANA tz database; zoneinfo needs this package
 # for BOT_TIMEZONE (runtime date/time state).

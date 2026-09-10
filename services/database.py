@@ -10,6 +10,7 @@ relationship_service）共用同一个 aiosqlite 连接。
 - relationships    基础关系（base_level 只允许 stranger/acquaintance/familiar）
 - user_memories    用户长期记忆（user_id + group_id 双重隔离）
 - user_relationships  好感度 affection（0~100，管理员设定，v0.2.6）
+- scheduled_task_runs 定时任务执行记录（v0.4，claim 幂等）
 
 注意：relationships 的 CHECK 约束刻意不允许 'close' —— close 是运行时派生状态，
 唯一来源是 .env 的 CLOSE_USER_ID；数据库层直接保证任何代码都无法持久化 close。
@@ -85,6 +86,20 @@ _CREATE_TABLES_SQL = (
         PRIMARY KEY (group_id, user_id)
     );
     """,
+    # 定时任务执行记录（v0.4）：UNIQUE(task_id, group_id, scheduled_date) 保证
+    # “每个任务 / 每个群 / 每天”最多一条 —— morning_greeting 幂等的数据库级保障。
+    """
+    CREATE TABLE IF NOT EXISTS scheduled_task_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL,
+        group_id INTEGER NOT NULL,
+        scheduled_date TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        finished_at DATETIME,
+        UNIQUE(task_id, group_id, scheduled_date)
+    );
+    """,
 )
 
 _CREATE_INDEXES_SQL = (
@@ -95,6 +110,9 @@ _CREATE_INDEXES_SQL = (
     # （INSERT OR IGNORE 依赖此唯一索引）
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_memories_dedup "
     "ON user_memories(user_id, group_id, memory_type, content);",
+    # 启动 catch-up 按 (task_id, scheduled_date) 查询今日执行记录
+    "CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_task_date "
+    "ON scheduled_task_runs(task_id, scheduled_date);",
 )
 
 # WAL 提升并发读写性能；busy_timeout 降低同时写时 database is locked 概率

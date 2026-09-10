@@ -8,11 +8,9 @@
   绝不访问真实 QQ / LLM / 搜索服务。
 """
 
-import asyncio
 from types import SimpleNamespace
 
 from nonebot.exception import FinishedException
-
 
 class FakeEvent:
     """伪 OneBot GroupMessageEvent。
@@ -87,6 +85,7 @@ async def _gate_scenario() -> None:
 
     import services.database as dbm
     from plugins import ai_chat as ai
+    from plugins import ambient as amb
     from plugins import context_recorder as cr
     from plugins import debug as dg
 
@@ -138,6 +137,62 @@ async def _gate_scenario() -> None:
     assert not await dg._debug_rule(ev)
     assert ev.plaintext_calls == 0, "未授权群的命令文本不应被规则层读取"
 
+    # ambient 插件门禁：未授权群不读正文、不进入 ambient 调度（不产生任何任务）
+    import plugins.ambient as ambient_plugin
+
+    ambient_calls: list = []
+
+    async def fake_on_group_message(event):
+        ambient_calls.append(event.group_id)
+
+    ambient_plugin.on_group_message = fake_on_group_message
+    ev = FakeEvent(333, 1001, 999, "unauthorized ambient chat")
+    await _call_handler(ambient_plugin.handle, ev)
+    assert ev.plaintext_calls == 0, "未授权群的 ambient 消息不应被读取正文"
+    assert ambient_calls == []
+
+    # 授权群 + AMBIENT_ENABLED=false（conftest 默认）：ambient 保持静默
+    ev = FakeEvent(111, 1001, 999, "authorized ambient chat")
+    await _call_handler(ambient_plugin.handle, ev)
+    assert ev.plaintext_calls == 0, "AMBIENT_ENABLED=false 时不应读取正文"
+    assert ambient_calls == []
+
+    # ===== Scheduled cron 注册（真实插件；只 add_job 不启动 scheduler） =====
+    nonebot.load_plugin("nonebot_plugin_apscheduler")
+    import services.scheduled_tasks as st
+    from nonebot_plugin_apscheduler import scheduler
+
+    morning_task = st.ScheduledTask(
+        "morning_greeting", "morning_greeting", True, 8, 0, frozenset({111}), False, 30, 10
+    )
+    night_task = st.ScheduledTask(
+        "night_greeting", "night_greeting", True, 21, 0, frozenset({111, 222}), False, 30, 10
+    )
+    st.SCHEDULED_TASKS_ENABLED = True
+    st.SCHEDULED_TASKS = {"morning_greeting": morning_task, "night_greeting": night_task}
+    try:
+        st.setup_scheduled_tasks(nonebot.get_driver())
+        morning_job = scheduler.get_job("task:morning_greeting")
+        assert morning_job is not None, "morning_greeting cron 应已注册"
+        assert morning_job.coalesce is True
+        assert morning_job.max_instances == 1
+        assert morning_job.misfire_grace_time == 1800
+        morning_fields = {f.name: list(f.expressions) for f in morning_job.trigger.fields}
+        assert str(morning_fields["hour"][0]) == "8"
+        assert str(morning_fields["minute"][0]) == "0"
+        assert str(morning_job.trigger.timezone) == "Asia/Shanghai"
+        # 注册表循环注册：night_greeting 同样被注册到自己的 cron
+        night_job = scheduler.get_job("task:night_greeting")
+        assert night_job is not None, "night_greeting cron 应已注册"
+        night_fields = {f.name: list(f.expressions) for f in night_job.trigger.fields}
+        assert str(night_fields["hour"][0]) == "21"
+        assert str(night_fields["minute"][0]) == "0"
+    finally:
+        scheduler.remove_job("task:morning_greeting")
+        scheduler.remove_job("task:night_greeting")
+        st.SCHEDULED_TASKS_ENABLED = False
+        st.SCHEDULED_TASKS = {}
+
     # ===== 授权群（111 / 222）：正常流程（AI 层桩替代） =====
     ev = FakeEvent(111, 1001, 999, "@bot hello")
     await _call_handler(ai.handle, ev)
@@ -163,9 +218,14 @@ async def _gate_scenario() -> None:
     assert await _count("relationships") == 0
     assert await _count("user_memories") == 0
 
-    await dbm.close_db()
+    # 数据库连接不在这里关闭：tests/conftest.py 的 session 级 autouse fixture
+    # 会在同一事件循环上统一关闭（在这里 close_db 会永久锁死后续测试的懒恢复）。
 
 
-def test_unauthorized_groups_have_no_side_effects():
-    """未授权群零副作用；授权群正常（全部桩化，不连真实 QQ / AI）。"""
-    asyncio.run(_gate_scenario())
+async def test_unauthorized_groups_have_no_side_effects():
+    """未授权群零副作用；授权群正常（全部桩化，不连真实 QQ / AI）。
+
+    跑在 pytest-asyncio 的 session 事件循环上：nonebot.init() 与 SQLite
+    连接都与其它异步测试共用同一 loop，session 结束统一关闭数据库。
+    """
+    await _gate_scenario()
