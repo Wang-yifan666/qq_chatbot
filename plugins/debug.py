@@ -2,6 +2,8 @@
 
 安全边界：
 - 只处理群消息（GroupMessageEvent），暂不处理私聊；
+- 群访问白名单（fail-closed）：未授权群的 \debug 消息同样直接丢弃，
+  不回复、不读写任何数据库（services/group_access.py 统一判断）；
 - 管理员白名单来自 .env 的 DEBUG_ADMIN_QQ（逗号分隔的 QQ 号）；
   DEBUG_ADMIN_QQ 为空时全部 debug 命令禁用；
 - 不在白名单的 QQ 回复「无权限使用调试命令。」；
@@ -32,6 +34,7 @@ from services.affection_store import list_group_affections
 from services.affection_store import set_affection
 from services.context_store import CONTEXT_MESSAGE_LIMIT
 from services.context_store import get_recent_messages
+from services.group_access import is_group_allowed
 from services.memory_retriever import MEMORY_TOP_K
 from services.relationship_service import get_effective_relationship
 from services.memory_retriever import retrieve_memories
@@ -107,6 +110,11 @@ debug = on_message(rule=Rule(_debug_rule), priority=1, block=True)
 
 @debug.handle()
 async def handle(event: GroupMessageEvent):
+    # 0. 群访问白名单（fail-closed）：未授权群直接丢弃，
+    #    不读取命令内容、不回复、不读写任何数据库。
+    if not is_group_allowed(event.group_id):
+        return
+
     text = event.get_plaintext().strip()
     nickname = sender_display_name(event)
     reply = await _execute_debug_command(text, event.user_id, event.group_id, nickname)

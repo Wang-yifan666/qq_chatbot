@@ -2,7 +2,7 @@
 
 一个运行在 Windows 上的 QQ 群聊 AI 机器人。
 
-**当前版本：v0.3.0 —— Persona RAG v0（夜子人格语料本地检索，接入 QQ 链路）**
+**当前版本：v0.3.1 —— 群聊访问白名单（`ALLOWED_GROUP_IDS`，fail-closed 静态白名单）**
 
 ```
 群里 @机器人 你的问题  →  程序生成可信状态（current_user_id / relationship / 日期时间 / capabilities）
@@ -17,11 +17,16 @@
 ```
 
 机器人能理解“这个”“那个”“刚才说的”“你刚才第二点是什么意思”“继续说”这类
-需要上下文的问题；所有群成员的普通聊天（不 @ 机器人）也会被记录，
+需要上下文的问题；所有**白名单群**成员的普通聊天（不 @ 机器人）也会被记录，
 供之后 @ 提问时作为背景材料。不同用户拥有独立长期记忆与关系进度，
 `CLOSE_USER_ID` 指定的唯一用户拥有 close 特殊关系。
 个人资料（姓名 / 爱好 / 技能 / 项目等）由管理员通过 `\debug memory set`
 显式维护，提问时经 Mini-RAG 检索后随问题一起发给模型。
+
+**群聊访问白名单（v0.3.1）**：只有 `.env` 的 `ALLOWED_GROUP_IDS` 中列出的 QQ 群，
+机器人才会响应 @、记录上下文、建立身份、更新关系、存储记忆；未配置 / 留空 =
+禁止所有群（fail-closed），`*` = 允许所有群。非白名单群完全忽略（详见下文
+「群聊访问白名单」）。
 
 ## 数据流
 
@@ -36,15 +41,19 @@ NapCat（机器人账号在线，把 QQ 消息转成 OneBot 11 协议）
   ↓
 NoneBot2（FastAPI 驱动，监听 127.0.0.1:8080）
   ↓
+群访问白名单 services/group_access.py（fail-closed）
+  ├─ 未授权群：直接丢弃（不回复 / 不记录 / 不调用 AI / 不写任何数据库）
+  └─ 授权群 ↓
 ├─ plugins/debug.py（priority=1, block=True，\\debug 开头即触发，无需 @）
 │     管理员调试命令：whoami / status / memory set|list|del|clear / rag
 │     维护 data/qq_ai_bot.db 中的个人资料（Personal Memory）
 │
 ├─ plugins/context_recorder.py（priority=20）
-│     所有群纯文本消息 → context_store 写入 SQLite（data/chat_history.db）
+│     白名单群纯文本消息 → context_store 写入 SQLite（data/chat_history.db）
 │     同时 upsert 用户身份（users 表）；只记录，不回复，不调用 AI
 │
 └─ plugins/ai_chat.py（priority=10, block=True，只有 @机器人 才触发）
+      ⓪ 群访问白名单检查：未授权群直接丢弃（不回复、不调 AI、不落库）
       ① upsert 用户身份（user_id 稳定身份，nickname 只是显示名）
       ② 读同群最近 N 条历史（旧 Context）
       ③ 保存当前问题（role=user）
@@ -62,14 +71,65 @@ NoneBot2（FastAPI 驱动，监听 127.0.0.1:8080）
       ⑬ 回答沿原路返回 → NoneBot2 → WebSocket → NapCat → QQ群回复
 ```
 
+## 群聊访问白名单（v0.3.1）
+
+`ALLOWED_GROUP_IDS` 决定 Bot 在哪些 QQ 群里工作。采用 **fail-closed** 模式：
+默认拒绝一切，避免机器人被意外拉入陌生群后自动回复、自动收集聊天内容。
+
+| 配置 | 行为 |
+| --- | --- |
+| `ALLOWED_GROUP_IDS=123456,987654321` | 只有群 123456 与 987654321 可用 |
+| `ALLOWED_GROUP_IDS=123, 456 , 789` | 逗号两侧空格允许，正常解析为 3 个群 |
+| `ALLOWED_GROUP_IDS=*` | 允许所有群（显式恢复 v0.3.0 之前的全部群可用行为） |
+| 未配置 / 留空 | 禁止所有群：Bot 不处理任何群聊（启动打印 WARNING，**不退出**，可能是有意暂时关闭） |
+| 含非法项（如 `111,abc`） | 启动阶段报 ERROR 并**退出**，提示检查 `ALLOWED_GROUP_IDS` |
+
+只有白名单群：
+
+- 会响应 @机器人（DeepSeek / 智谱 GLM / fallback / web_search 都在此之后才可能发生）
+- 会记录群聊上下文（`messages`）
+- 会建立用户身份（`users`）
+- 会更新关系等级（`relationships`）
+- 会存储长期记忆（`user_memories`）
+
+非白名单群**完全忽略**：不回复任何内容（包括只 @ 时也不回复「有什么想问我的？」）、
+不调用任何 AI API（不产生费用）、不触发 fallback、不启动 memory extractor、
+不读取 / 保存任何 Context 与 Memory、不更新任何关系，群消息正文也不进入本项目的
+日志与数据库。这是隐私边界：即使机器人被意外拉进陌生群，也不会在后台收集该群
+的聊天内容。
+
+实现要点：
+
+- 环境变量解析、合法性检查、白名单判断全部集中在 `services/group_access.py`
+  （`is_group_allowed(group_id)`），ai_chat / context_recorder / debug 三个插件
+  共用同一份判断，没有第二份字符串解析；
+- 判断位于每个处理器的最前面：未授权群的 @ 消息由 ai_chat（priority=10,
+  block=True）拦截后直接丢弃，事件不会继续传播到 context_recorder（priority=20），
+  因此不会入库；未授权群的普通消息由 context_recorder 自己丢弃；
+- 启动日志只输出数量 / 状态，不打印真实 QQ 群号：
+
+  ```
+  [INFO] ... | [GROUP ACCESS] allowed groups configured: 2
+  [INFO] ... | [GROUP ACCESS] all groups are allowed
+  [WARNING] ... | [GROUP ACCESS] no allowed groups configured; all group messages will be ignored
+  [ERROR] ... | [GROUP ACCESS] ALLOWED_GROUP_IDS 配置非法：只能包含英文逗号分隔的正整数 QQ 群号，或单独一个 *（表示允许所有群），请检查 .env
+  ```
+
+- 白名单修改后**重启 Bot 生效**。本阶段不做群管理员命令、动态增删、SQLite 群配置表、
+  Web 管理后台、黑名单、用户白名单、私聊权限、.env 热加载。
+
 ## 功能范围
 
 已实现：
 
 - 只处理 QQ **群聊**消息（私聊一律不响应）
+- **群聊访问白名单（v0.3.1）**：`ALLOWED_GROUP_IDS` 静态白名单（fail-closed）。
+  只有白名单群会响应 @ / 记录上下文 / 建立用户身份 / 更新关系等级 / 存储长期记忆；
+  未配置或留空 = 禁止所有群；`*` = 允许所有群；非法群号启动报错退出；
+  白名单修改后重启生效（详见上文「群聊访问白名单」）
 - 只有 **@机器人** 才响应；普通非 @ 消息完全不回复、不产生任何模型费用
 - 提取 @ 之后的纯文本问题（自动去掉 QQ 的 CQ Code）
-- **SQLite 群聊历史**：所有群纯文本消息写入 `data/chat_history.db`
+- **SQLite 群聊历史**：所有**白名单群**纯文本消息写入 `data/chat_history.db`
   （aiosqlite 异步访问，WAL + busy_timeout，启动时自动建库建表）
 - **同群最近 N 条短期上下文**（`CONTEXT_MESSAGE_LIMIT`，默认 20，约束 1~50）：
   机器人能理解“这个”“那个”“刚才说的”“你刚才第二点是什么意思”等指代，
@@ -137,6 +197,9 @@ NoneBot2（FastAPI 驱动，监听 127.0.0.1:8080）
 
 暂不实现（保持范围小）：
 
+- 群管理员命令 / 动态添加删除白名单 / SQLite 群配置表 / Web 管理后台
+- 黑名单 / 用户白名单 / 私聊权限 / 权限等级 / `.env` 热加载 / 数据库迁移系统
+  （本版本只有静态 `.env` 群白名单，改完重启生效）
 - 完整文档知识库 RAG / Embedding / 向量数据库（FAISS / Milvus / Qdrant / pgvector 等）——
   Personal Memory 使用 SQLite 精确匹配；**Persona RAG 使用 NumPy 本地索引**（v0.3.0，
   无独立向量数据库服务）
@@ -174,7 +237,8 @@ qq_ai_bot/
 │
 ├── scripts/
 │   ├── build_persona_rag.py  # 语料 → 本地索引（语料更新后手动重跑，Bot 启动不重算）
-│   └── test_persona_rag.py   # 本地检索质量测试（接 QQ 前先检查）
+│   ├── test_persona_rag.py   # 本地检索质量测试（接 QQ 前先检查）
+│   └── test_group_access.py  # 群聊白名单验证（纯解析 + 启动语义 + 插件门禁，无测试框架）
 │
 ├── docs/
 │   ├── persona_schema.md     # DialogueUnit 字段说明（可提交）
@@ -184,12 +248,13 @@ qq_ai_bot/
 ├── plugins/
 │   ├── __init__.py
 │   ├── debug.py           # \debug 管理员命令（priority=1, block=True，白名单鉴权）
-│   ├── ai_chat.py         # @机器人 处理：读历史 → 检索记忆 → Persona RAG → 构造 Prompt →
-│   │                      #   调模型（主备）→ 存回答 → 回复；per-group 锁
-│   └── context_recorder.py# 记录所有群纯文本消息（priority=20, 不回复）
+│   ├── ai_chat.py         # @机器人 处理：群白名单 → 读历史 → 检索记忆 → Persona RAG →
+│   │                      #   构造 Prompt → 调模型（主备）→ 存回答 → 回复；per-group 锁
+│   └── context_recorder.py# 记录白名单群纯文本消息（priority=20, 不回复）
 │
 └── services/
     ├── __init__.py            # redact_secrets：日志密钥脱敏
+    ├── group_access.py        # 群聊访问白名单：ALLOWED_GROUP_IDS 解析 + is_group_allowed（v0.3.1）
     ├── database.py            # SQLite 唯一入口：连接 + 全部建表/索引（WAL）
     ├── context_store.py       # messages：群聊短期上下文读写
     ├── user_store.py          # users：用户身份（user_id 稳定身份）
@@ -241,6 +306,8 @@ pip install -r requirements.txt
 # 4. 创建并编辑 .env（完整模板见下文「.env 模板」小节）
 #    用 DeepSeek：AI_PROVIDER=deepseek，填 DEEPSEEK_API_KEY=sk-xxxxxxxx
 #    用智谱 GLM：AI_PROVIDER=zhipu，填 ZHIPU_API_KEY=xxxxxx.xxxxxxxx
+#    并填写 ALLOWED_GROUP_IDS=你的QQ群号（多个用逗号分隔；
+#    未配置时 Bot 对所有群沉默，详见「群聊访问白名单」）
 
 # 5. 启动 NoneBot2（先启动它，再启动 NapCat）
 python bot.py
@@ -262,6 +329,13 @@ python bot.py
 DRIVER=~fastapi
 HOST=127.0.0.1
 PORT=8080
+
+# ===== Group access control (v0.3.1) =====
+# 允许 Bot 工作的 QQ 群号，多个使用英文逗号分隔（逗号两侧允许空格）
+# 未配置或留空 = 禁止所有群（fail-closed：Bot 对所有群完全沉默）
+# * = 允许所有群（显式恢复旧版本行为）
+# 非法群号（非纯数字）会在启动时报错退出
+ALLOWED_GROUP_IDS=
 
 # ===== AI provider =====
 # 主服务商：deepseek | zhipu
@@ -449,7 +523,11 @@ ZHIPU_MODEL=glm-4.7-flash
 
 ### 群消息如何进入 SQLite
 
-- 所有群纯文本消息（包括没有 @ 机器人的）由 `plugins/context_recorder.py` 记录，
+- **群访问白名单最先执行**：未授权群的任何消息（无论是否 @机器人）都在处理器
+  最前面被丢弃，绝不写入 `messages` / `users` / `relationships` / `user_memories`。
+  @机器人 的消息先由 `ai_chat`（priority=10, block=True）拦截丢弃（事件不再传播），
+  普通消息由 `context_recorder` 自己丢弃；
+- 所有**白名单群**的纯文本消息（包括没有 @ 机器人的）由 `plugins/context_recorder.py` 记录，
   写入 `data/chat_history.db` 的 `messages` 表（`role=user`），同时 upsert 用户身份
   （`users` 表）。纯图片 / 表情等无文本消息不记录。
 - `context_recorder` 的匹配器 `priority=20, block=False`；`ai_chat` 的匹配器
@@ -462,6 +540,8 @@ ZHIPU_MODEL=glm-4.7-flash
 
 ### @机器人 时的处理顺序
 
+0. 群访问白名单检查（fail-closed）：未授权群直接丢弃——不读取 / 不记录问题正文、
+   不回复、不调用 AI、不落库、不启动任何后台任务；
 1. 提取纯文本问题；问题为空 → 回复「有什么想问我的？」（不调 API）；
 2. upsert 用户身份（`user_id` 稳定身份，`nickname` 只是显示名）；
 3. 先读该群最近 `CONTEXT_MESSAGE_LIMIT` 条历史（**旧 Context**）；
@@ -792,6 +872,8 @@ DeepSeek / 智谱 GLM（失败用同一 messages 降级备用）→ 回复
 
 ## 本地测试步骤
 
+0. `.env` 配置 `ALLOWED_GROUP_IDS=<测试群号>`（多个用逗号分隔）后启动；非白名单群
+   应完全沉默（不回复、不落库、不调用 AI）；
 1. `.env` 填入 `DEBUG_ADMIN_QQ=你的QQ号`（逗号分隔可配多人），启动 `python bot.py`；
 2. 群里发 `\debug whoami`，记下自己的 user_id 与 group_id；
 3. `\debug memory set <qq> name 小王`、`\debug memory set <qq> hobby STM32和机器人`、
@@ -884,6 +966,8 @@ DeepSeek / 智谱 GLM（失败用同一 messages 降级备用）→ 回复
 
 ## 测试方法（验收用例）
 
+> 下表 Case 1~50 默认在**已加入白名单的测试群**中执行；Case 51~57 为群聊访问白名单用例。
+
 在测试群里，用另一个 QQ 账号操作：
 
 | 用例 | 操作 | 预期结果 |
@@ -938,11 +1022,20 @@ DeepSeek / 智谱 GLM（失败用同一 messages 降级备用）→ 回复
 | Case 48 | 回答含 3 个自然段 | QQ 中依次收到 3 条消息；SQLite 仍只有 1 条完整 assistant 回答 |
 | Case 49 | 回答含带空行的代码块 | 代码块作为整体发送，不从中间断开 |
 | Case 50 | 模型输出 20 个自然段 | 最多发送 `SPLIT_REPLY_MAX_PARTS` 条，剩余合并进最后一条 |
+| Case 51 | 非白名单群发 `@机器人 hello` | 机器人完全沉默；不调用任何 AI API；`messages` / `users` / `relationships` / `user_memories` 均无新增 |
+| Case 52 | 非白名单群发普通消息 `你好`（不 @） | 完全沉默，该消息不进入 SQLite（Context 不收集） |
+| Case 53 | 非白名单群只发 `@机器人` | 完全沉默，不回复「有什么想问我的？」 |
+| Case 54 | `ALLOWED_GROUP_IDS=111,222`：群 111 / 222 与群 333 分别 @机器人 | 111 / 222 正常工作；333 完全忽略 |
+| Case 55 | `ALLOWED_GROUP_IDS=*` | 恢复 v0.3.0 的全部群可用行为 |
+| Case 56 | `ALLOWED_GROUP_IDS=111,abc` 启动 | 启动即报 ERROR 并退出，提示检查 `ALLOWED_GROUP_IDS` |
+| Case 57 | `ALLOWED_GROUP_IDS=111, 222 ,333` | 逗号两侧空格正确解析，三个群都可用 |
 
 > v0.1 的 Case 1~6、v0.2 的 Case 7~13、v0.2.2 的 Case 14~20、v0.2.5 的 Case 21~30、
 > v0.2.6 的 Case 31~35 与 v0.2.3 的 Case 36~50 均已在本项目开发环境中通过自动化验证
 > （构造 OneBot 事件 + 临时 SQLite 库 + 假 Provider / 假搜索后端 + mock 时间 +
-> 子进程配置切换 + 真实 API 与真实 Bing 搜索冒烟）；上表 Case 7 / 12 / 25 / 26 /
+> 子进程配置切换 + 真实 API 与真实 Bing 搜索冒烟）；v0.3.1 的 Case 51~57 已通过
+> 自动化验证（纯解析 + 子进程启动语义 + 构造 OneBot 事件 + 临时 SQLite 库 +
+> 假 Provider，见 `scripts/test_group_access.py`）；上表 Case 7 / 12 / 25 / 26 /
 > 31~34 / 36~46 的语义效果另需在真实 QQ 群中用模型实测确认。
 
 ### 日志参考
@@ -950,8 +1043,15 @@ DeepSeek / 智谱 GLM（失败用同一 messages 降级备用）→ 回复
 启动时（SQLite 初始化成功）：
 
 ```
+[INFO] __main__ | [GROUP ACCESS] allowed groups configured: 2   # 或 all groups are allowed / no allowed groups configured（WARNING）
 [INFO] __main__ | [RELATIONSHIP] close target configured     # 或：未配置 close 用户（CLOSE_USER_ID 为空）
 [INFO] __main__ | [CONTEXT] SQLite 存储已就绪：D:\qq_chatbot\data\chat_history.db
+```
+
+未授权群收到 @ 消息（只打印群号，绝不打印该群的聊天正文）：
+
+```
+[INFO] ai_chat | [GROUP ACCESS] ignored unauthorized group group_id=333
 ```
 
 收到 @ 消息：
@@ -978,6 +1078,8 @@ DeepSeek / 智谱 GLM（失败用同一 messages 降级备用）→ 回复
 
 - 所有服务只监听本机回环地址（`127.0.0.1`）：NoneBot2 监听 8080、NapCat WebUI 监听 6099，
   均不暴露到公网或局域网；
+- 群聊访问白名单 fail-closed：未授权群的消息不回复、不调用 AI、不写入任何数据库，
+  本项目日志也只打印群号、不打印未授权群的消息正文；
 - OneBot 反向 WebSocket 已配置 Access Token（`.env` 的 `ONEBOT_ACCESS_TOKEN` 与 NapCat 侧一致），
   无令牌的连接会被 403 拒绝；
 - API Key 只存放在 `.env`（已被 `.gitignore` 忽略，且文件权限已收紧为仅当前用户可读写），
@@ -988,6 +1090,11 @@ DeepSeek / 智谱 GLM（失败用同一 messages 降级备用）→ 回复
   3. 明白任何能访问该端口的机器都能向 Bot 发送消息。
 
 ## 常见问题
+
+**Q：更新到 v0.3.1 后机器人对所有群都没反应了？**
+这是群聊访问白名单的 fail-closed 设计：`ALLOWED_GROUP_IDS` 未配置或留空时禁止所有群。
+在 `.env` 里填上允许的群号（如 `ALLOWED_GROUP_IDS=123456, 789012`，或 `*` 恢复全部群可用），
+重启后生效。
 
 **Q：启动提示「未检测到 DEEPSEEK_API_KEY / ZHIPU_API_KEY」？**
 当前 `AI_PROVIDER` 指向的服务商没有填 Key。要么填上对应的 Key，要么把 `AI_PROVIDER`

@@ -5,6 +5,7 @@
 2. 初始化 NoneBot2
 3. 注册 OneBot V11 适配器
 4. 启动前检查关键配置（所选 AI 服务商的 API Key）
+   以及群聊访问白名单（ALLOWED_GROUP_IDS，fail-closed）
 5. 加载 plugins/ 下的插件并启动
 
 运行方式（在项目根目录执行）：
@@ -138,6 +139,27 @@ if CLOSE_USER_ID is not None:
     logger.info("[RELATIONSHIP] close target configured")
 else:
     logger.info("[RELATIONSHIP] 未配置 close 用户（CLOSE_USER_ID 为空）")
+
+# 5.5 群聊访问白名单校验（fail-closed）：
+#     解析与合法性检查集中在 services/group_access.py；非法配置（如 111,abc）
+#     在启动阶段报 ERROR 并退出，而不是等第一条群消息才暴露。
+#     日志只输出群数量，不打印真实 QQ 群号。
+try:
+    from services.group_access import ALLOWED_GROUP_IDS
+    from services.group_access import ALLOW_ALL_GROUPS
+except ValueError as exc:
+    logger.error("[GROUP ACCESS] {}", redact_secrets(str(exc)))
+    sys.exit(1)
+
+if ALLOW_ALL_GROUPS:
+    logger.info("[GROUP ACCESS] all groups are allowed")
+elif not ALLOWED_GROUP_IDS:
+    # 用户可能故意暂时关闭机器人：只 WARNING，不退出
+    logger.warning(
+        "[GROUP ACCESS] no allowed groups configured; all group messages will be ignored"
+    )
+else:
+    logger.info("[GROUP ACCESS] allowed groups configured: {}", len(ALLOWED_GROUP_IDS))
 
 # 6. 加载 plugins/ 目录下的全部插件（ai_chat / context_recorder）。
 nonebot.load_plugins("plugins")

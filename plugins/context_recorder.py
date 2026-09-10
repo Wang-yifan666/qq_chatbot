@@ -1,12 +1,16 @@
-"""群聊上下文记录插件（v0.2）：把群里所有纯文本消息写入 SQLite。
+"""群聊上下文记录插件（v0.2 → v0.3.1 群白名单）：把白名单群里所有纯文本消息写入 SQLite。
 
 职责边界：
 - 只负责“记录”，永不回复、永不调用 AI、不产生任何模型费用；
-- 记录对象是群里所有纯文本消息，即使没有 @机器人
+- 记录对象是白名单群里所有纯文本消息，即使没有 @机器人
   （这是“真群聊上下文”的前提：A/B 的讨论也要入库，机器人才能理解“那”指什么）；
+- 群访问白名单（fail-closed）：处理器第一行就执行 is_group_allowed(event.group_id)，
+  未授权群的任何消息直接丢弃——不写 messages / users / relationships /
+  user_memories，也不读取消息正文。这是隐私边界：即使机器人被意外拉进陌生群，
+  也不会在后台收集该群的聊天内容；
 - 不负责 @机器人 的消息：ai_chat 的匹配器 priority=10、block=True，
-  本匹配器 priority=20、block=False。@ 消息被 ai_chat 拦截并由它自己保存，
-  保证每条消息最多入库一次；
+  本匹配器 priority=20、block=False。@ 消息被 ai_chat 拦截并由它自己保存
+  （未授权群时由 ai_chat 的白名单检查拦截丢弃），保证每条消息最多入库一次；
 - 防御性跳过机器人自身消息（event.user_id == event.self_id）：即使 NapCat
   开启 reportSelfMessage，机器人回复也不会被重复保存
   （机器人回答由 ai_chat 以 role=assistant 主动保存）。
@@ -21,6 +25,7 @@ from nonebot import on_message
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
 from services.context_store import add_message
+from services.group_access import is_group_allowed
 from services.prompt_builder import sender_display_name
 from services.user_store import upsert_user
 
@@ -33,6 +38,11 @@ recorder = on_message(priority=20, block=False)
 async def handle(event: GroupMessageEvent):
     # handler 参数声明为 GroupMessageEvent：私聊等非群消息事件不匹配本 handler
     # （NoneBot2 事件参数按类型过滤，见 nonebot/internal/params.py 的 EventParam）
+
+    # 0. 群访问白名单（fail-closed）：未授权群的任何消息直接丢弃，
+    #    不读取消息内容、不写任何表。权限判断必须在一切 DB 副作用之前。
+    if not is_group_allowed(event.group_id):
+        return
 
     # 防御 reportSelfMessage：机器人自己的消息不记录（回答由 ai_chat 保存）
     if event.user_id == event.self_id:

@@ -1,6 +1,8 @@
-"""AI 聊天插件（v0.3.0）：群里 @机器人 → 用户状态 + 短期上下文 + 人格 → AI 模型 → 群回复。
+"""AI 聊天插件（v0.3.1）：群里 @机器人 → 用户状态 + 短期上下文 + 人格 → AI 模型 → 群回复。
 
 处理顺序（同一群内的 @ 处理通过 per-group asyncio.Lock 串行）：
+0. 群访问白名单（fail-closed）：未授权群直接丢弃——不读取/不记录问题正文、
+   不回复、不调用 AI、不触发 fallback、不落库、不启动任何后台任务；
 1. 只处理 QQ 群消息（GroupMessageEvent），只有 @机器人 才触发（to_me 规则）；
 2. 提取纯文本问题；问题为空时保持 v0.1 行为：直接回复提示，不调用 API；
 3. 用户身份 upsert（user_id 稳定身份，nickname 只是显示名）；
@@ -23,7 +25,10 @@
 群消息入库分工（与 plugins/context_recorder.py 配合）：
 - 普通非 @ 群消息 → context_recorder（priority=20）入库（同时 upsert 用户）；
 - @机器人 的消息 → 本插件（priority=10, block=True）拦截，由本插件自己保存，
-  保证每条消息最多保存一次。
+  保证每条消息最多保存一次；
+- 两个插件都在处理器最前面执行同一个群访问白名单检查（services/group_access.py）：
+  未授权群的任何消息（无论是否 @机器人）都直接丢弃，不写 messages / users /
+  relationships / user_memories，也不产生任何 AI 调用。
 """
 
 import asyncio
@@ -43,6 +48,7 @@ from services.context_store import add_message
 from services.context_store import get_recent_messages
 from services.deepseek import ask_deepseek
 from services.deepseek import call_deepseek
+from services.group_access import is_group_allowed
 from services.memory_extractor import extract_memories
 from services.memory_retriever import MEMORY_MAX_CHARS
 from services.memory_retriever import MEMORY_TOP_K
@@ -182,6 +188,20 @@ async def _ask_with_fallback(
 
 @chat.handle()
 async def handle(event: GroupMessageEvent):
+    # 0. 群访问白名单（fail-closed）：必须在读取 / 输出用户问题内容之前判断。
+    #    未授权群直接结束处理：不回复任何内容（包括「有什么想问我的？」）、
+    #    不调用 AI / fallback、不 upsert 用户、不读写 Context / Memory、
+    #    不增加关系计数、不启动 memory extractor，不产生任何 API 费用。
+    #    本匹配器 block=True：即使这里直接 return，事件也不会再传播到
+    #    context_recorder（priority=20），因此未授权消息不会入库。
+    #    日志只输出群号，绝不输出该群的聊天正文。
+    if not is_group_allowed(event.group_id):
+        logger.info(
+            "[GROUP ACCESS] ignored unauthorized group group_id={}",
+            event.group_id,
+        )
+        return
+
     # get_plaintext() 只保留纯文本，自动去掉 @ 本体和所有 CQ Code。
     question = event.get_plaintext().strip()
 
