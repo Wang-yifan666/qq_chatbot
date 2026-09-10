@@ -8,9 +8,12 @@ services/prompt_builder.py 负责，保证主备服务商收到完全相同的 P
 - 使用 OpenAI 官方 SDK 的 AsyncOpenAI（异步客户端），不会阻塞
   NoneBot2 的 asyncio 事件循环；
 - API Key 从环境变量 DEEPSEEK_API_KEY 读取，严禁硬编码；
-- 模型名从环境变量 DEEPSEEK_MODEL 读取，未配置时使用默认值 deepseek-v4-flash；
+- 模型名从环境变量 DEEPSEEK_MODEL 读取，未配置时使用默认值 deepseek-flash
+  （V4.1 Flash，原生支持 text + image 多模态）；
 - 客户端懒加载：首次调用时才创建。这样当 .env 里 AI_PROVIDER=zhipu
-  （即本次不选用 DeepSeek）时，缺少 DEEPSEEK_API_KEY 也不会影响 Bot 启动。
+  （即本次不选用 DeepSeek）时，缺少 DEEPSEEK_API_KEY 也不会影响 Bot 启动；
+- Transport 层对 content 不做任何处理：字符串 content 与 multimodal list
+  content（含 image_url block）都原样交给 SDK，绝不 str() 化、绝不 json.dumps。
 """
 
 import os
@@ -29,9 +32,11 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_TIMEOUT = 60.0
 
 # 默认模型名从环境变量读取，不散落在业务代码里；未配置时用默认值
-# DeepSeek 当前支持的模型名：deepseek-v4-flash / deepseek-v4.1-flash（限时内测）/
-# deepseek-v4-pro（deepseek-chat 为兼容别名）
-DEFAULT_MODEL = os.getenv("DEEPSEEK_MODEL") or "deepseek-v4-flash"
+# DeepSeek 当前推荐模型名：deepseek-flash（V4.1 Flash，支持 text + image）；
+# deepseek-chat（V4 Pro 的兼容别名，text-only）。
+# 注意：deepseek-v4-flash-vision-exp 属于上一代 Vision Exp，仅作兼容 alias 保留，
+# 不要作为新功能的模型名。
+DEFAULT_MODEL = os.getenv("DEEPSEEK_MODEL") or "deepseek-flash"
 
 _client: AsyncOpenAI | None = None
 
@@ -55,13 +60,15 @@ def _get_client() -> AsyncOpenAI:
 
 
 async def call_deepseek(
-    messages: list[dict[str, str]],
+    messages: list[dict],
     model: str | None = None,
     tools: list[dict] | None = None,
 ) -> RawCompletion | None:
     """原始调用：返回内容 + 可能的 tool_calls（供 Tool Orchestrator 使用）。
 
     tools 为 OpenAI 兼容工具定义列表；None 表示不启用工具。
+    messages 的 content 可能是 str 或 multimodal list（含 image_url block）：
+    Transport 层一律原样透传，绝不做 str() / json.dumps 转换。
     任何失败返回 None（异常只记日志，Bot 不崩溃）。
     """
     selected_model = model or DEFAULT_MODEL
@@ -106,13 +113,13 @@ async def call_deepseek(
 
 
 async def ask_deepseek(
-    messages: list[dict[str, str]],
+    messages: list[dict],
     model: str | None = None,
 ) -> str | None:
     """把构造好的 messages 发给 DeepSeek（无工具路径，兼容旧调用）。
 
     model：本次调用使用的模型名；None 时使用默认模型（DEEPSEEK_MODEL，
-    未配置则 deepseek-v4-flash）。同服务商双模型降级时由调用方传入。
+    未配置则 deepseek-flash）。同服务商双模型降级时由调用方传入。
     """
     raw = await call_deepseek(messages, model=model)
     return raw.content if raw else None

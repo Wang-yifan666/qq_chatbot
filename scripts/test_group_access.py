@@ -190,6 +190,7 @@ class FakeEvent:
 
     get_plaintext 模拟 onebot v11 的真实行为：去掉开头的 @机器人 本体，
     因此 "@bot" → ""、 "@bot hello" → "hello"。
+    get_message 返回空 segment 列表（v0.5 视觉提取兼容：默认没有图片）。
     """
 
     def __init__(self, group_id: int, user_id: int, self_id: int, text: str):
@@ -198,6 +199,7 @@ class FakeEvent:
         self.self_id = self_id
         self._text = text
         self.plaintext_calls = 0
+        self.message_calls = 0
         # sender_display_name 需要 sender（authorized 路径才会读到）
         self.sender = SimpleNamespace(user_id=user_id, nickname="小明", card="")
 
@@ -205,8 +207,12 @@ class FakeEvent:
         self.plaintext_calls += 1
         text = self._text
         if text.startswith("@bot"):
-            text = text[len("@bot"):].strip()
+            text = text[len("@bot") :].strip()
         return text
+
+    def get_message(self) -> list:
+        self.message_calls += 1
+        return []
 
 
 class FakeChat:
@@ -265,7 +271,7 @@ async def test_plugin_gates() -> None:
     # --- 替换 AI 调用与回复通道（绝不打真实 API） ---
     calls = {"answer": 0}
 
-    async def fake_answer(event, question: str) -> str:
+    async def fake_answer(event, question: str, images=None, image_total: int = 0) -> str:
         calls["answer"] += 1
         return "stub-answer"
 

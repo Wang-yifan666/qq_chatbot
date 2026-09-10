@@ -17,15 +17,26 @@ class FakeEvent:
     """伪 OneBot GroupMessageEvent。
 
     get_plaintext 模拟 onebot v11 真实行为：去掉开头的 @机器人 本体；
-    plaintext_calls 用于断言“未授权群根本没读取正文”。
+    plaintext_calls / message_calls 用于断言“未授权群根本没读取正文 / 图片”。
+    message_segments 模拟 event.get_message() 的 MessageSegment 列表
+    （SimpleNamespace(type=..., data=...)）。
     """
 
-    def __init__(self, group_id: int, user_id: int, self_id: int, text: str):
+    def __init__(
+        self,
+        group_id: int,
+        user_id: int,
+        self_id: int,
+        text: str,
+        segments: list | None = None,
+    ):
         self.group_id = group_id
         self.user_id = user_id
         self.self_id = self_id
         self._text = text
+        self._segments = segments if segments is not None else []
         self.plaintext_calls = 0
+        self.message_calls = 0
         self.to_me = False
         self.sender = SimpleNamespace(user_id=user_id, nickname="小明", card="")
 
@@ -35,6 +46,10 @@ class FakeEvent:
         if text.startswith("@bot"):
             text = text[len("@bot") :].strip()
         return text
+
+    def get_message(self) -> list:
+        self.message_calls += 1
+        return self._segments
 
 
 class FakeChat:
@@ -95,8 +110,11 @@ async def _gate_scenario() -> None:
     # --- 替换 AI 调用与回复通道（绝不打真实 API） ---
     calls = {"answer": 0}
 
-    async def fake_answer(event, question: str) -> str:
+    async def fake_answer(event, question: str, images=None, image_total: int = 0) -> str:
         calls["answer"] += 1
+        calls["last_images"] = images
+        calls["last_image_total"] = image_total
+        calls["last_question"] = question
         return "stub-answer"
 
     ai._answer = fake_answer
@@ -118,6 +136,20 @@ async def _gate_scenario() -> None:
     await _call_handler(ai.handle, ev)
     assert not ai_chat.finished, "未授权群只 @ 也不得回复提示语"
     assert ev.plaintext_calls == 0
+
+    # v0.5 视觉隐私边界：未授权群带图 @ → 图片 segment 根本不被读取
+    ev = FakeEvent(
+        333,
+        1001,
+        999,
+        "@bot",
+        segments=[SimpleNamespace(type="image", data={"url": "http://evil/1.jpg"})],
+    )
+    await _call_handler(ai.handle, ev)
+    assert ev.plaintext_calls == 0, "未授权群不应读取正文"
+    assert ev.message_calls == 0, "未授权群不得读取图片 segment（白名单在任何提取之前）"
+    assert calls["answer"] == 0
+    assert not ai_chat.finished
 
     # 普通消息 → 不写 messages / users / relationships / user_memories
     ev = FakeEvent(333, 1003, 999, "hello from unauthorized group")
@@ -246,6 +278,107 @@ async def _gate_scenario() -> None:
     assert pending_ambient.cancelled(), "@-only 路径也应取消 pending ambient"
     assert gstate.ambient_pending_task is None
     await asyncio.gather(pending_ambient, return_exceptions=True)
+
+    # ===== v0.5 DIRECT Vision（授权群；AI 层桩替代） =====
+    from services.vision import VISION_ENABLED as _VI
+
+    assert _VI is True  # conftest 默认开启
+    # 纯文本 @ 行为与 v0.4 完全一致：不出现任何图片输入
+    ev = FakeEvent(111, 1001, 999, "@bot hello")
+    await _call_handler(ai.handle, ev)
+    assert calls["last_images"] == []
+    assert calls["last_question"] == "hello"
+
+    # @夜子 + 1 张图片 + 文字 → 进入 pipeline，图片随问题一起交给模型层
+    ev = FakeEvent(
+        111,
+        1001,
+        999,
+        "@bot 你觉得这个怎么样",
+        segments=[SimpleNamespace(type="image", data={"url": "http://x/1.jpg"})],
+    )
+    await _call_handler(ai.handle, ev)
+    assert calls["last_question"] == "你觉得这个怎么样"
+    assert len(calls["last_images"]) == 1
+    assert calls["last_images"][0].url == "http://x/1.jpg"
+    assert calls["last_image_total"] == 1
+
+    # @夜子 + 纯图片 → 不能回复旧的「有什么想问我的？」，必须进入 LLM pipeline
+    ev = FakeEvent(
+        111,
+        1001,
+        999,
+        "@bot",
+        segments=[SimpleNamespace(type="image", data={"url": "http://x/2.jpg"})],
+    )
+    await _call_handler(ai.handle, ev)
+    assert ai_chat.finished[-1] == "stub-answer", "纯图片应进入 AI pipeline 而不是提示语"
+    assert calls["last_question"] == ""
+    assert len(calls["last_images"]) == 1
+    assert calls["last_image_total"] == 1
+
+    # 多图：顺序保持、不超过 VISION_MAX_IMAGES（默认 4）
+    ev = FakeEvent(
+        111,
+        1001,
+        999,
+        "@bot 比较一下这两张图",
+        segments=[
+            SimpleNamespace(type="image", data={"url": f"http://x/m{i}.jpg"})
+            for i in range(6)
+        ],
+    )
+    await _call_handler(ai.handle, ev)
+    assert calls["last_image_total"] == 6
+    assert len(calls["last_images"]) == 4
+    assert [img.url for img in calls["last_images"]] == [
+        "http://x/m0.jpg",
+        "http://x/m1.jpg",
+        "http://x/m2.jpg",
+        "http://x/m3.jpg",
+    ]
+
+    # 无有效 URL 的图片段被拒绝：有文字时照常走纯文本 pipeline
+    ev = FakeEvent(
+        111,
+        1001,
+        999,
+        "@bot 看看这个",
+        segments=[SimpleNamespace(type="image", data={"file": "broken.img"})],
+    )
+    await _call_handler(ai.handle, ev)
+    assert calls["last_images"] == []
+    assert calls["last_image_total"] == 1
+
+    # VISION_ENABLED=false + 纯图片 → 稳定降级回复，且不进入 LLM pipeline
+    before = calls["answer"]
+    ai.VISION_ENABLED = False
+    ev = FakeEvent(
+        111,
+        1001,
+        999,
+        "@bot",
+        segments=[SimpleNamespace(type="image", data={"url": "http://x/3.jpg"})],
+    )
+    await _call_handler(ai.handle, ev)
+    assert ai_chat.finished[-1] == "我现在看不到图片。"
+    assert calls["answer"] == before, "视觉关闭的纯图片请求不得调用模型"
+    ai.VISION_ENABLED = True
+
+    # VISION_ENABLED=false + 图片 + 文字 → 纯文本正常回答（行为稳定降级）
+    ai.VISION_ENABLED = False
+    ev = FakeEvent(
+        111,
+        1001,
+        999,
+        "@bot 上面这句话什么意思",
+        segments=[SimpleNamespace(type="image", data={"url": "http://x/4.jpg"})],
+    )
+    await _call_handler(ai.handle, ev)
+    assert calls["last_question"] == "上面这句话什么意思"
+    assert calls["last_images"] == []
+    assert ai_chat.finished[-1] == "stub-answer"
+    ai.VISION_ENABLED = True
 
     # 白名单群普通消息 → 正常写入 messages + users（context_recorder 永不写关系/记忆）
     ev = FakeEvent(111, 1003, 999, "hello from allowed group")

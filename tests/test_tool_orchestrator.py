@@ -207,6 +207,50 @@ class TestRunWithTools:
         )
         assert answer is None
 
+    async def test_multimodal_user_content_preserved_through_tool_rounds(self, monkeypatch):
+        """带图片的 user content 在工具轮次中绝不能丢失 / 字符串化（v0.5 vision + tools）。"""
+        from services.vision import VisionImage
+        from services.vision import attach_images_to_last_user_message
+
+        searched = []
+
+        async def fake_search(query):
+            searched.append(query)
+            return [{"title": "t", "url": "u", "snippet": "s"}]
+
+        monkeypatch.setattr("services.tool_orchestrator.search", fake_search)
+
+        multimodal = attach_images_to_last_user_message(
+            [
+                {"role": "system", "content": "S"},
+                {"role": "user", "content": "当前消息：\n这个多少钱"},
+            ],
+            [VisionImage(url="http://x/1.jpg", detail="auto")],
+        )
+        completions = [
+            RawCompletion(
+                content=None,
+                tool_calls=[{"id": "c1", "name": "web_search", "arguments": '{"query": "价格"}'}],
+            ),
+            RawCompletion(content="大概 199。", tool_calls=[]),
+        ]
+        seen: list[list[dict]] = []
+
+        async def call_fn(messages, tools):
+            seen.append([dict(m) for m in messages])
+            return completions.pop(0) if completions else None
+
+        answer = await run_with_tools(call_fn, multimodal, [WEB_SEARCH_TOOL_SCHEMA])
+        assert answer == "大概 199。"
+        assert searched == ["价格"]
+        # 每一轮请求里，最初的 user 消息都仍保留 image_url block
+        for messages in seen:
+            user_messages = [m for m in messages if m.get("role") == "user"]
+            assert user_messages
+            original = user_messages[0]["content"]
+            assert isinstance(original, list)
+            assert any(part.get("type") == "image_url" for part in original)
+
     async def test_max_tool_calls_constant_is_positive(self):
         assert MAX_TOOL_CALLS_PER_TURN > 0
         assert MAX_TOOL_ROUNDS > 0

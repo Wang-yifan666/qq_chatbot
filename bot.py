@@ -66,7 +66,8 @@ driver.register_adapter(OneBotV11Adapter)
 VALID_PROVIDERS = ("deepseek", "zhipu")
 
 # 各服务商默认模型（与 services/deepseek.py / zhipu.py 保持一致，仅用于启动校验）
-_PROVIDER_DEFAULT_MODELS = {"deepseek": "deepseek-v4-flash", "zhipu": "glm-4.7-flash"}
+# DeepSeek 当前推荐模型：deepseek-flash（V4.1 Flash，原生支持 text + image）
+_PROVIDER_DEFAULT_MODELS = {"deepseek": "deepseek-flash", "zhipu": "glm-4.7-flash"}
 
 
 def _effective_primary_model(provider: str) -> str:

@@ -32,6 +32,10 @@ os.environ["LOG_MESSAGE_CONTENT"] = "false"
 os.environ["SCHEDULED_TASKS_ENABLED"] = "false"
 os.environ["MORNING_GREETING_ENABLED"] = "false"
 os.environ["AMBIENT_ENABLED"] = "false"
+# v0.5 视觉：与代码默认一致地显式开启（个别用例 monkeypatch 模块属性关闭）
+os.environ["VISION_ENABLED"] = "true"
+os.environ["VISION_MAX_IMAGES"] = "4"
+os.environ["VISION_DETAIL"] = "auto"
 os.environ.setdefault("AI_PROVIDER", "deepseek")
 os.environ.setdefault("AI_FALLBACK", "")
 

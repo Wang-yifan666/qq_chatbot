@@ -2,24 +2,26 @@
 
 一个运行在 Windows 上的 QQ 群聊 AI 机器人。
 
-**当前版本：v0.4 —— 主动行为双触发系统（Scheduled 定时任务 + AMBIENT 自然插话，Persona 单一来源）**
+**当前版本：v0.5 —— DIRECT Vision MVP**
 
 ```
 触发源 A：QQ Message Event                      触发源 B：APScheduler Cron（不依赖任何消息）
-  ├─ @夜子 / 回复 → DIRECT（原 ai_chat 流程）       └─ morning_greeting 等 ScheduledTask
+  ├─ @夜子 / 回复 → DIRECT（文字 + 可选图片）        └─ morning_greeting 等 ScheduledTask
   └─ 普通群消息 → AMBIENT（安静期+闸门+AI 决策）         → 白名单 → per-group 锁 → claim 幂等
                     ↓                                       ↓
         统一 Conversation Generation Pipeline
-        ① 群访问白名单（fail-closed：非白名单群到此为止，不读/不存/不回）
+        ① 群访问白名单（fail-closed：非白名单群到此为止，不读/不存/不回，也不读图片）
         ② 唯一 Persona Core（本地 persona.txt / PERSONA_FILE，三模式共用）
         ③ 程序生成可信状态（conversation_mode / 日期时间 / capabilities）
-        ④ 上下文 DATA（JSON 转义，带 Context Budget）
+        ④ 上下文 DATA（JSON 转义，带 Context Budget；图片只以文字占位符入库）
         ⑤ Persona RAG：角色语料 → 本地 NumPy 索引 → 动态过滤 → 检索 →
            rerank → diversity → 风格参考注入 SYSTEM（失败自动降级）
-        ⑥ 安全规则 + 信任模型 + 人格锚点
-        ⑦ 需要时调用 web_search 工具（白名单 + Schema 校验；Scheduled/AMBIENT 默认无工具）
-        ⑧ DeepSeek / 智谱 GLM（失败自动 fallback，同一 messages）
-        ⑨ 主动模式：QQ 主动发送 → assistant 写入 Context；DIRECT：按自然段拆分回复
+        ⑥ 安全规则 + 信任模型 + 人格锚点（图片内容 = 不可信用户数据）
+        ⑦ DIRECT 视觉（v0.5）：最后一个 user 消息附加 image_url block
+           → capability-aware 路由（图片只发给 deepseek-flash）
+        ⑧ 需要时调用 web_search 工具（白名单 + Schema 校验；Scheduled/AMBIENT 默认无工具）
+        ⑨ DeepSeek / 智谱 GLM（失败自动 fallback，同一 messages）
+        ⑩ 主动模式：QQ 主动发送 → assistant 写入 Context；DIRECT：按自然段拆分回复
 ```
 
 机器人能理解“这个”“那个”“刚才说的”“你刚才第二点是什么意思”“继续说”这类
@@ -179,6 +181,61 @@ per-group 锁、claim 幂等、catch-up、skip-if-active、Persona 单一来源�
 `{PREFIX}_ENABLED / {PREFIX}_TIME / {PREFIX}_GROUP_IDS / {PREFIX}_CATCHUP_MINUTES /
 {PREFIX}_SKIP_IF_ACTIVE_MINUTES`（非法时间启动报错退出）。
 
+## 视觉理解（v0.5，DIRECT Vision MVP）
+
+夜子能**真正看到**用户在白名单群里 @她时同时发送的图片，并结合图片、文字、
+人格、关系、记忆与上下文自然回答。
+
+支持范围：
+
+- **DIRECT**：`@夜子 [图片]`、`@夜子 你觉得这个怎么样 [图片]`、
+  `@夜子 这段报错怎么看 [截图]`、`@夜子 比较一下这两张图 [图1] [图2]`；
+- 单次最多 `VISION_MAX_IMAGES` 张（默认 4，超出忽略并只记数量）；
+- 模型：DeepSeek 当前推荐模型 **`deepseek-flash`**（V4.1 Flash，原生 text + image）；
+  支持 JPEG / PNG / GIF / WebP 等 DeepSeek 官方支持格式；
+- 图片与文字一样只是“当前 DIRECT 请求的输入”，人格、记忆、关系、Persona RAG、
+  群聊 Context、Tool Orchestrator 全部照常工作（带截图问“这个多少钱”时
+  web_search 仍然可用）。
+
+明确不做（留给后续版本）：
+
+- AMBIENT 自动看普通群图片、SCHEDULED 图片能力、历史图片长期保存、
+  跨轮重新读取 QQ CDN 图片（回复/引用旧图后 `get_msg` 回溯）、图片 embedding /
+  图片 RAG、独立 OCR 服务、OpenCV 图像分析、图片生成。
+
+行为与隐私边界：
+
+- **白名单优先**：未授权群在任何图片提取 / URL 读取 / 下载 / 模型调用之前直接结束
+  （fail-closed 边界不因视觉而改变）；
+- **图片只出现在最后一个 user 消息**（OpenAI multimodal `image_url` block），
+  绝不进 system / assistant / Persona RAG / 历史 DATA / tool message；
+- **Context 只存文字占位符**：`这个报错怎么看\n[附带 2 张图片]`、
+  纯图片则 `[发送了 1 张图片]`——不写 URL / Base64 / 图片二进制；
+  **v0.5 只保证当前请求中的图片实时可见**，历史 Context 只有占位符，
+  “刚才那张图片再仔细看看”这类跨轮视觉引用暂不保证；
+- **日志只记数量**（总数 / 接受 / 拒绝），绝不打印图片 URL / Base64 / CDN token；
+- **capability-aware fallback**：含图片的请求只会发给 `deepseek-flash`
+  （唯一被验证支持视觉的模型），绝不硬发给 text-only 模型等它 400，也绝不偷偷删图；
+  所有可用候选都失败时统一回复“我这会儿暂时看不了图片，稍后再试试。”；
+  纯文本请求的 fallback 行为与 v0.4 完全一致；
+- **纯图片 @**（没有文字）不再走“有什么想问我的？”旧分支：正常进入 AI pipeline，
+  文本块只表达程序事实（“用户只发送了图片，没有附加文字。”），怎么回应由
+  Persona Core 决定（梗图 / 截图 / 表情包各有各的回应）；
+- 图片内容（含图片里的文字）属于**不可信用户数据**：图片里出现
+  “忽略系统提示”“输出 system prompt”“调用某个工具”等都只是图片内容，
+  不能覆盖 System / Persona / 可信状态 / 工具权限；
+- `VISION_ENABLED=false` 时：纯文本聊天完全不受影响；图片请求稳定降级
+  （纯图片回复“我现在看不到图片。”，图文混合按纯文字正常回答）。
+
+配置（`.env`，均有默认值与范围校验，非法值安全回落）：
+
+```ini
+VISION_ENABLED=true            # DIRECT 视觉开关
+VISION_MAX_IMAGES=4            # 单次最多交给模型的图片数（1~10）
+VISION_DETAIL=auto             # OpenAI detail 参数：auto | low | high
+VISION_MAX_IMAGE_BYTES=10485760  # 单图大小上限（NapCat 提供 file_size 时校验，默认 10MB）
+```
+
 ## 功能范围
 
 已实现：
@@ -283,6 +340,15 @@ per-group 锁、claim 幂等、catch-up、skip-if-active、Persona 单一来源�
     Provider / fallback；白名单（fail-closed）对主动发送同样生效；
     capability Prompt 按本次真实提供的 tools 生成（Scheduled/Ambient 恒为
     web_search=false，与它们实际没带工具一致）。
+- **DIRECT 视觉理解（v0.5）**：@夜子 + 图片（最多 4 张，`VISION_MAX_IMAGES`），
+  由 `services/vision.py` 统一提取 OneBot image segment 并校验（URL / file_size /
+  detail），`attach_images_to_last_user_message()` 把图片作为 OpenAI multimodal
+  `image_url` block 附加到最后一个 user 消息；沿用同一套 `build_messages()`
+  （人格/关系/记忆/RAG/Context 全部保留）；`llm_client` capability-aware 路由：
+  含图请求只发给 `deepseek-flash`（唯一验证支持视觉的模型），text-only 候选
+  直接跳过，绝不删图硬发；纯图片 @ 正常进入 pipeline（文本块只表达程序事实）；
+  Context 只存 `[附带 N 张图片]` 占位符，日志只记数量；视觉同样受 fail-closed
+  白名单保护（未授权群连图片 segment 都不读取）。详见「视觉理解」章节。
 
 暂不实现（保持范围小）：
 
@@ -297,7 +363,9 @@ per-group 锁、claim 幂等、catch-up、skip-if-active、Persona 单一来源�
 - 天气早安 / 每日新闻 / 随机主动私聊 / 心情系统 / 行为树 / 多个 Cron 管理 UI /
   动态编辑任务 / 数据库存完整 Cron 配置（v0.4 只做 morning_greeting 一个任务）
 - 通用 Agent / 多工具编排（当前只有白名单内的 `web_search` 一个工具）
-- 图片理解 / 图片 RAG
+- 图片 RAG / 图片 embedding / 历史图片长期保存 / 跨轮重读 QQ CDN 图片 /
+  AMBIENT / SCHEDULED 视觉 / 独立 OCR 服务 / OpenCV 图像分析 / 图片生成
+  （v0.5 只做“当前 DIRECT 请求的原生视觉理解”）
 - 私聊 AI
 - Tokenizer / 上下文自动摘要（超出预算直接丢弃旧内容，不做压缩）
 - Romance Mode（v0.3.0 明确不实现：close ≠ 恋爱，默认排除 `romance_specific=true`
@@ -339,6 +407,9 @@ qq_ai_bot/
 │   ├── test_scheduled_task_store.py# claim 幂等 + 状态更新 + has_recent_bot_message（v0.4）
 │   ├── test_scheduled_execution.py # morning_greeting 全流程（mock）：幂等/离线/跳过/锁（v0.4）
 │   ├── test_ambient.py            # 决策解析 / 闸门 / 防抖 / ambient 生成管线（v0.4）
+│   ├── test_vision.py             # 图片提取/限制/attach/占位符/纯函数（v0.5）
+│   ├── test_llm_vision_fallback.py# capability-aware fallback：视觉请求只发给视觉模型（v0.5）
+│   ├── test_model_config.py       # DeepSeek 默认模型 = deepseek-flash 基线（v0.5）
 │   ├── test_reply_splitter.py # 回复拆分（短文本 / 段落 / 代码块 / 上限 / 极端输入）
 │   ├── test_tool_orchestrator.py  # web_search 参数校验 + 工具白名单 + 次数/轮数上限（mock 搜索）
 │   └── test_relationship_service.py # calculate_base_level 阈值（永不产生 close）
@@ -365,7 +436,8 @@ qq_ai_bot/
     ├── __init__.py            # redact_secrets + 日志隐私开关（v0.3.1）
     ├── group_access.py        # 群聊访问白名单：ALLOWED_GROUP_IDS 解析 + is_group_allowed（v0.3.1）
     ├── group_conversation.py  # 群会话共享状态：DIRECT/AMBIENT/SCHEDULED 共用 per-group 锁（v0.4）
-    ├── llm_client.py          # 统一 LLM 调用层：Provider/fallback/工具编排（三模式共用，v0.4）
+    ├── vision.py              # QQ 图片 → 模型 image input：提取/限制/attach/占位符（v0.5）
+    ├── llm_client.py          # 统一 LLM 调用层：capability-aware fallback/工具编排（v0.4→v0.5）
     ├── proactive_sender.py    # 主动发送：OneBot Bot 查找 + send_group_msg + assistant 入库（v0.4）
     ├── scheduled_tasks.py     # ScheduledTask 抽象 + morning_greeting cron + catch-up（v0.4）
     ├── scheduled_task_store.py# scheduled_task_runs：原子 claim / 状态更新（幂等，v0.4）
@@ -468,12 +540,12 @@ AI_FALLBACK=deepseek
 # 可选：主模型覆盖（留空 = 用服务商默认模型）
 # AI_MODEL=
 # 备用模型（AI_FALLBACK 与 AI_PROVIDER 相同时必填；跨服务商时可留空）
-AI_FALLBACK_MODEL=deepseek-v4-flash
+AI_FALLBACK_MODEL=deepseek-chat
 
 # ===== DeepSeek API =====
 DEEPSEEK_API_KEY=
-# 主模型（AI_MODEL 为空时生效）；v4.1-flash 为限时内测模型
-DEEPSEEK_MODEL=deepseek-v4.1-flash
+# 主模型（AI_MODEL 为空时生效）；deepseek-flash = V4.1 Flash，text + image 多模态
+DEEPSEEK_MODEL=deepseek-flash
 
 # ===== Zhipu (GLM) API =====
 ZHIPU_API_KEY=
@@ -576,6 +648,16 @@ AMBIENT_MAX_PER_HOUR=3
 # 触发消息少于多少字直接忽略（1~200，默认 4）
 AMBIENT_MIN_MESSAGE_CHARS=4
 
+# ===== Vision (v0.5, DIRECT only; deepseek-flash 原生支持图片) =====
+# 让夜子真正“看到”@她时同时发送的图片（AMBIENT / SCHEDULED 不读图片）
+VISION_ENABLED=true
+# 单次请求最多交给模型的图片数（1~10，默认 4；超出忽略）
+VISION_MAX_IMAGES=4
+# OpenAI detail 参数：auto | low | high（默认 auto）
+VISION_DETAIL=auto
+# 单图大小上限（字节；NapCat 提供 file_size 时校验，默认 10MB = 10485760）
+VISION_MAX_IMAGE_BYTES=10485760
+
 # ===== Persona RAG (v0.3.0, NumPy 本地索引，无向量数据库) =====
 # 角色人格语料检索开关
 PERSONA_RAG_ENABLED=true
@@ -615,8 +697,8 @@ PERSONA_RAG_DEBUG=false
 
 | 服务商 | 配置值 | 需要填的 Key | 默认模型 | API 地址（代码中写死） |
 | --- | --- | --- | --- | --- |
-| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-v4-flash` | `https://api.deepseek.com` |
-| 智谱 GLM | `zhipu` | `ZHIPU_API_KEY` | `glm-4.7-flash` | `https://open.bigmodel.cn/api/paas/v4` |
+| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-flash`（V4.1 Flash，text + image） | `https://api.deepseek.com` |
+| 智谱 GLM | `zhipu` | `ZHIPU_API_KEY` | `glm-4.7-flash`（text-only） | `https://open.bigmodel.cn/api/paas/v4` |
 
 只有**被用到的服务商**才要求填 Key；没用到的 Key 可以留空，不影响启动。
 
@@ -627,18 +709,18 @@ PERSONA_RAG_DEBUG=false
    - 主模型 = `AI_MODEL`（或 `DEEPSEEK_MODEL` / `ZHIPU_MODEL` 默认模型）；
    - 备用模型 = `AI_FALLBACK_MODEL`（**必填**，且必须与主模型不同，否则启动报错）。
 
-当前推荐配置（DeepSeek flash 系双模型）：
+当前推荐配置（DeepSeek flash 主 + chat 备）：
 
 ```ini
 AI_PROVIDER=deepseek
 AI_FALLBACK=deepseek
-DEEPSEEK_MODEL=deepseek-v4.1-flash   # 主模型（限时内测）
-AI_FALLBACK_MODEL=deepseek-v4-flash  # 备用模型（稳定版）
+DEEPSEEK_MODEL=deepseek-flash   # 主模型（V4.1 Flash，text + image）
+AI_FALLBACK_MODEL=deepseek-chat # 备用模型（V4 Pro 兼容别名，text-only）
 ```
 
 主模型 400 / 限流 / 超时等任何失败时，自动用**完全相同的 messages** 调备用模型，
-人格、身份、关系、记忆、上下文都不变。内测模型尚未生效期间，主模型会失败并自动
-落到 `deepseek-v4-flash`，Bot 照常工作；资格生效后无需改动即自动切回。
+人格、身份、关系、记忆、上下文都不变。视觉请求（含图片）只会发给支持图片的
+`deepseek-flash`，绝不会发给 text-only 的备用模型（详见「视觉理解」章节）。
 
 推荐配置（GLM 平时免费，DeepSeek 兜底，跨服务商降级）：
 
@@ -653,17 +735,18 @@ AI_FALLBACK=deepseek   # 备：GLM 限流/出错时自动改用 DeepSeek
 AI_PROVIDER=deepseek
 AI_FALLBACK=deepseek                 # 同服务商双模型降级
 DEEPSEEK_API_KEY=sk-你的key
-DEEPSEEK_MODEL=deepseek-v4.1-flash   # 主模型（限时内测；也可换成 v4-flash / v4-pro）
-AI_FALLBACK_MODEL=deepseek-v4-flash  # 备用模型（与主模型不同）
+DEEPSEEK_MODEL=deepseek-flash        # 主模型（V4.1 Flash，text + image 多模态）
+AI_FALLBACK_MODEL=deepseek-chat      # 备用模型（V4 Pro 兼容别名，text-only；与主模型不同）
 ```
 
 - Key 从 https://platform.deepseek.com 的「API Keys」页面获取。
-- `DEEPSEEK_MODEL`：主模型名，**不填时默认 `deepseek-v4-flash`**（代码里
+- `DEEPSEEK_MODEL`：主模型名，**不填时默认 `deepseek-flash`**（代码里
   `services/deepseek.py` 的 `DEFAULT_MODEL`）。
-  DeepSeek API 当前支持：`deepseek-v4-flash`（稳定版）、`deepseek-v4-pro`（更强）、
-  `deepseek-v4-flash-vision-exp`（多模态实验版）、`deepseek-v4.1-flash`（限时内测，
-  需账号有内测资格）。注意模型名必须**全小写**，写错大小写会报 400；
-  无资格时调用 4.1-flash 会返回 400，Bot 会自动降级到 `AI_FALLBACK_MODEL`。
+  DeepSeek API 当前推荐：`deepseek-flash`（V4.1 Flash，原生支持 text + image）、
+  `deepseek-chat`（V4 Pro 的兼容别名，text-only）。
+  **`deepseek-v4-flash-vision-exp` 属于上一代 Vision Exp，仅作兼容 alias 暂时保留，
+  不要使用**；`deepseek-v4.1-flash` 的“限时内测”说法也已过时。
+  模型名必须**全小写**，写错大小写会报 400。
 - `AI_MODEL`：可选的主模型覆盖（优先于 `DEEPSEEK_MODEL`）；`AI_FALLBACK_MODEL`：
   备用模型（主备同服务商时必填且须与主模型不同，跨服务商时可留空）。
 
@@ -1174,6 +1257,20 @@ python -m compileall bot.py plugins services scripts tests
 - `test_ambient.py`（v0.4）：决策 JSON 解析（垃圾输入按不说话）、决策 Prompt 结构、
   cheap gate（每小时上限 / 冷却 / 关闭）、太短消息不调度、防抖重排取消旧任务、
   决策 false 全程沉默、ambient 生成管线（无工具 / 无 current_user / 发送后写 Context）；
+- `test_vision.py`（v0.5）：image segment 提取与校验（无 URL / file_size 超限 /
+  数量截断 / 顺序保持）、`attach_images_to_last_user_message`（图片只进最后一个
+  user 消息、原 messages 不被修改）、`build_context_text` 占位符（绝不含 URL /
+  Base64）、配置默认值与非法值回落；
+- `test_llm_vision_fallback.py`（v0.5）：capability-aware 路由——视觉请求绝不发给
+  text-only 候选（主模型 text-only 时直接跳过主）、无可用视觉候选返回 None、
+  纯文本请求 fallback 行为与 v0.4 一致；
+- `test_model_config.py`（v0.5）：DeepSeek 默认模型 = `deepseek-flash`，
+  vision-capable 集合只含 deepseek-flash；
+- `test_group_gate.py`（v0.5 扩展）：未授权群带图 @ → 图片 segment 不被读取
+  （白名单在任何提取之前）、纯图片 @ 进入 pipeline、图文混合、多图截断、
+  `VISION_ENABLED=false` 的稳定降级；
+- `test_tool_orchestrator.py`（v0.5 扩展）：带图片的 user content 在工具轮次中
+  保持完整（不丢失 / 不字符串化）；
 - `test_reply_splitter.py`：短文本不拆 / 自然段拆分 / max chars / max parts /
   代码块不拆坏 / 空与极端输入；
 - `test_tool_orchestrator.py`：web_search 参数校验（非 JSON / query 非字符串 / 空 /
@@ -1382,8 +1479,10 @@ NapCat 比 NoneBot 晚连接 / 在任务时间后、catch-up 窗口内（默认 
 `UnicodeDecodeError`；pydantic 读 .env 也有类似风险。注释用英文可以从根源上避免。
 
 **Q：想换模型？**
-DeepSeek：改 `.env` 的 `DEEPSEEK_MODEL`（如 `deepseek-v4-flash`、`deepseek-v4-pro`，注意全小写）。
-智谱：改 `ZHIPU_MODEL`（默认 `glm-4.7-flash`）。改完重启生效。
+DeepSeek：改 `.env` 的 `DEEPSEEK_MODEL`（推荐 `deepseek-flash`，支持 text + image；
+备用可用 `deepseek-chat`，注意全小写）。智谱：改 `ZHIPU_MODEL`（默认 `glm-4.7-flash`）。
+改完重启生效。注意：只有 `deepseek-flash` 被标记为 vision-capable——
+把主模型换成 `deepseek-chat` 时，含图片的请求会自动跳过主模型、只用支持视觉的候选。
 
 ## 后续扩展方向
 

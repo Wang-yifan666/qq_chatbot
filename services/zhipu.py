@@ -52,7 +52,7 @@ def _get_client() -> AsyncOpenAI:
 
 
 async def call_glm(
-    messages: list[dict[str, str]],
+    messages: list[dict],
     model: str | None = None,
     tools: list[dict] | None = None,
 ) -> RawCompletion | None:
@@ -102,7 +102,7 @@ async def call_glm(
 
 
 async def ask_glm(
-    messages: list[dict[str, str]],
+    messages: list[dict],
     model: str | None = None,
 ) -> str | None:
     """把构造好的 messages 发给智谱 GLM（无工具路径，兼容旧调用）。

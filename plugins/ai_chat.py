@@ -4,7 +4,10 @@
 0. 群访问白名单（fail-closed）：未授权群直接丢弃——不读取/不记录问题正文、
    不回复、不调用 AI、不触发 fallback、不落库、不启动任何后台任务；
 1. 只处理 QQ 群消息（GroupMessageEvent），只有 @机器人 才触发（to_me 规则）；
-2. 提取纯文本问题；问题为空时保持 v0.1 行为：直接回复提示，不调用 API；
+2. 提取纯文本问题与 image segment（v0.5 DIRECT Vision）：
+   问题与图片都为空时保持 v0.1 行为（回复提示，不调用 API）；
+   有图片时正常进入 AI pipeline（图片只进最后一个 user 消息，
+   Context 只存文字占位符）；
 3. 用户身份 upsert（user_id 稳定身份，nickname 只是显示名）；
 4. 先读取该群最近 CONTEXT_MESSAGE_LIMIT 条历史（旧 Context）；
 5. 保存当前用户问题（role=user）；
@@ -36,7 +39,6 @@ import asyncio
 from nonebot import logger
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
-from nonebot.rule import to_me
 
 from services import log_message_content_enabled
 from services import redact_secrets
@@ -71,17 +73,49 @@ from services.reply_splitter import SPLIT_REPLY_DELAY_MS
 from services.reply_splitter import SPLIT_REPLY_ENABLED
 from services.reply_splitter import split_reply
 from services.user_store import upsert_user
+from services.vision import VISION_ALL_FAILED_REPLY
+from services.vision import VISION_DISABLED_REPLY
+from services.vision import VISION_ENABLED
+from services.vision import VISION_READ_FAILED_REPLY
+from services.vision import VisionImage
+from services.vision import attach_images_to_last_user_message
+from services.vision import convert_unsupported_images
+from services.vision import build_context_text
+from services.vision import extract_images
 
 # 记忆提取的最小问题长度（太短的寒暄不值得多花一次 LLM 调用）
 _MEMORY_EXTRACT_MIN_LEN = 6
 # 记忆提取单次调用超时（秒），超时放弃，不影响回复
 _MEMORY_EXTRACT_TIMEOUT = 20.0
 
+
+async def _rule_direct_mention(event: GroupMessageEvent) -> bool:
+    """DIRECT 触发规则：@机器人 或 回复机器人。
+
+    为什么不用 to_me()：NapCat v4.18.19 在「图片段在前」的群消息里会漏发
+    OneBot 事件的 to_me 字段（实测：image+at+text 的原始 JSON 没有 to_me 键），
+    nonebot-adapter-onebot 对缺失字段按 False 处理，导致带图 @ 无法触发。
+    这里在 to_me 缺失时兜底检查消息里的 at 段，同时保留回复机器人语义。
+    """
+    if event.to_me:
+        return True
+    self_id = str(event.self_id)
+    if any(
+        getattr(seg, "type", None) == "at"
+        and str((getattr(seg, "data", None) or {}).get("qq", "")) == self_id
+        for seg in event.message
+    ):
+        return True
+    if event.reply is not None and event.reply.sender.user_id == event.self_id:
+        return True
+    return False
+
+
 # 消息事件匹配器：
-# - rule=to_me()：只有 @机器人（或回复机器人）的消息才进入本处理器
+# - rule=_rule_direct_mention：@机器人（或回复机器人）；含 NapCat 漏发 to_me 的兜底
 # - priority=10：比 context_recorder 的 20 更先执行
 # - block=True：处理完后不再交给后续低优先级处理器（context_recorder 不重复保存）
-chat = on_message(rule=to_me(), priority=10, block=True)
+chat = on_message(rule=_rule_direct_mention, priority=10, block=True)
 
 # 同一群的 @ 处理串行（不同群互不阻塞）：锁来自 services/group_conversation.py，
 # DIRECT / AMBIENT / SCHEDULED 三种模式共用同一把 per-group 锁。
@@ -113,6 +147,25 @@ async def handle(event: GroupMessageEvent):
     # get_plaintext() 只保留纯文本，自动去掉 @ 本体和所有 CQ Code。
     question = event.get_plaintext().strip()
 
+    # 0.6 图片提取（v0.5 DIRECT Vision）：白名单已通过才允许读取 image segment。
+    #     日志只记数量统计，绝不输出图片 URL / Base64 / CDN token。
+    extraction = extract_images(event)
+    accepted_images: list[VisionImage] = extraction.images if VISION_ENABLED else []
+    dropped = extraction.rejected + (len(extraction.images) if not VISION_ENABLED else 0)
+    # 0.61 格式兼容：DeepSeek 不收的格式（如 BMP）内存中转成 JPEG data URL。
+    #      转换失败保留原图（外链直传仍可能成功），不计入 dropped。
+    if VISION_ENABLED and accepted_images:
+        accepted_images, _convert_failed = await convert_unsupported_images(accepted_images)
+    logger.info(
+        "[VISION] group_id={} user_id={} enabled={} images_total={} accepted={} rejected={}",
+        event.group_id,
+        event.user_id,
+        VISION_ENABLED,
+        extraction.total,
+        len(accepted_images),
+        dropped,
+    )
+
     # 收到 @ 消息的基础日志（隐私：默认只记长度，绝不默认打印问题正文；严禁打印 API Key）
     if log_message_content_enabled():
         logger.info(
@@ -132,10 +185,10 @@ async def handle(event: GroupMessageEvent):
             len(question),
         )
 
-    # 只 @ 了机器人、后面没有问题：保持 v0.1 行为，直接提示，不调用 API。
+    # 只 @ 了机器人、没有任何正文也没有任何图片：保持 v0.1 行为，直接提示，不调用 API。
     # 与其它模式一致：机器人实际发出的这句话也要写进 Context（只写一次），
     # 并且让 has_recent_bot_message 生效——DIRECT 刚结束时 AMBIENT 不会马上插话。
-    if not question:
+    if not question and extraction.total == 0:
         await add_message(
             group_id=event.group_id,
             user_id=event.self_id,
@@ -145,7 +198,26 @@ async def handle(event: GroupMessageEvent):
         )
         await chat.finish("有什么想问我的？")
 
-    answer = await _answer(event, question)
+    # 只有图片、没有文字，但一张图都不可用（视觉关闭 / 全部被拒）：
+    # 给稳定、明确的降级回复，而不是假装没收到。
+    if not question and extraction.total > 0 and not accepted_images:
+        reply = VISION_DISABLED_REPLY if not VISION_ENABLED else VISION_READ_FAILED_REPLY
+        await add_message(
+            group_id=event.group_id,
+            user_id=event.self_id,
+            nickname=BOT_NAME,
+            role="assistant",
+            content=reply,
+        )
+        await chat.finish(reply)
+
+    # 其余情况（有文字、或文字+图、或纯图片且图片可用）都进入 AI pipeline。
+    answer = await _answer(
+        event,
+        question,
+        images=accepted_images,
+        image_total=extraction.total,
+    )
 
     # 多自然段拆成多条 QQ 消息（防刷屏）：前 N-1 条用 send，最后一条用 finish。
     # 注意：SQLite 里的 assistant 回答始终只保存完整原始 answer 一次（在 _answer 内）。
@@ -160,13 +232,22 @@ async def handle(event: GroupMessageEvent):
         await chat.finish(answer)
 
 
-async def _answer(event: GroupMessageEvent, question: str) -> str:
+async def _answer(
+    event: GroupMessageEvent,
+    question: str,
+    images: list[VisionImage] | None = None,
+    image_total: int = 0,
+) -> str:
     """用户状态 → 旧 Context → 保存问题 → 记忆/关系 → 构造 Prompt → 调模型 → 保存。
 
     整个流程持本群专用锁执行（与 AMBIENT / SCHEDULED 共用同一把锁）：
     同一群的 @ 问题串行处理；不同群锁相互独立，互不阻塞。
     返回要发给群里的最终文本（成功回答 / 统一的服务不可用提示）。
+
+    images：通过校验、要交给模型的图片（None/[] = 纯文本请求，行为与 v0.4 一致）；
+    image_total：消息里的图片总数（写入 Context 的文字占位符用，绝不写 URL）。
     """
+    images = images or []
     async with get_group_conversation_state(event.group_id).lock:
         user_id = event.user_id
         group_id = event.group_id
@@ -178,13 +259,14 @@ async def _answer(event: GroupMessageEvent, question: str) -> str:
         # 2. 先读旧 Context（读完才保存当前问题，避免当前问题在 Prompt 中出现两遍）
         history = await get_recent_messages(group_id, CONTEXT_MESSAGE_LIMIT)
 
-        # 3. 保存当前用户问题；失败只记日志（store 内部处理），不影响本轮回答
+        # 3. 保存当前用户问题；失败只记日志（store 内部处理），不影响本轮回答。
+        #    图片只以文字占位符入库（[附带 N 张图片]），绝不写 URL / Base64。
         await add_message(
             group_id=group_id,
             user_id=user_id,
             nickname=nickname,
             role="user",
-            content=question,
+            content=build_context_text(question, image_total),
         )
 
         # 4. 该用户在本群的长期记忆（user_id + group_id 双重隔离）
@@ -262,23 +344,37 @@ async def _answer(event: GroupMessageEvent, question: str) -> str:
 
         # 8. 只构造一次 messages；主备服务商共用，
         #    人格 / 身份 / 关系 / 亲近倾向 / 记忆 / Personal Memory / Persona RAG /
-        #    上下文完全一致
+        #    上下文完全一致。
+        #    纯图片（question 为空）时，文本块表达程序事实，而不是替用户编问题：
+        #    让 Persona Core 决定夜子自然怎么回应（梗图/截图/表情包各有各的回应）。
+        prompt_question = question if question else "用户只发送了图片，没有附加文字。"
         messages = build_messages(
             current_user=CurrentUser(user_id=user_id, display_name=nickname),
             relationship=relationship,
             memories=memories,
             history=history,
-            question=question,
+            question=prompt_question,
             personal_memory_context=memory_context,
             relationship_context=relationship_context,
             persona_refs=persona_refs,
         )
 
-        # 9. 主备调用（同一 messages；DIRECT 模式按 WEB_SEARCH_ENABLED 决定工具）
-        answer, used_provider = await ask_with_fallback(messages, TOOLS)
+        # 8.5 视觉：沿用同一套 messages，只把最后一个 user 消息变成 multimodal
+        #     （图片只进 user content，绝不进 system / assistant / tool / 历史 DATA）。
+        if images:
+            messages = attach_images_to_last_user_message(messages, images)
+
+        # 9. 主备调用（capability-aware：含图片时 require_vision=True，
+        #     绝不把图片请求发给 text-only 候选；纯文本行为与 v0.4 一致）
+        answer, used_provider = await ask_with_fallback(
+            messages, TOOLS, require_vision=bool(images)
+        )
 
         if not answer:
-            # 两个服务商都失败时，不把任何异常细节或 API Key 发到群里
+            # 视觉请求所有可用候选都失败 / 纯文本主备都失败：
+            # 不把任何异常细节或 API Key 发到群里
+            if images:
+                return VISION_ALL_FAILED_REPLY
             return "AI 服务暂时不可用，请稍后再试。"
 
         # 10. chat.finish() 会结束当前 Handler，因此必须先把回答写入数据库再回复
