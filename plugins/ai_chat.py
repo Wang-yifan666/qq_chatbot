@@ -35,6 +35,7 @@
 """
 
 import asyncio
+import re
 
 from nonebot import logger
 from nonebot import on_message
@@ -72,6 +73,7 @@ from services.relationship_service import record_direct_interaction
 from services.reply_splitter import SPLIT_REPLY_DELAY_MS
 from services.reply_splitter import SPLIT_REPLY_ENABLED
 from services.reply_splitter import split_reply
+from services.runtime_context import get_now
 from services.user_store import upsert_user
 from services.vision import VISION_ALL_FAILED_REPLY
 from services.vision import VISION_DISABLED_REPLY
@@ -146,6 +148,20 @@ async def handle(event: GroupMessageEvent):
 
     # get_plaintext() 只保留纯文本，自动去掉 @ 本体和所有 CQ Code。
     question = event.get_plaintext().strip()
+
+    # 0.55 \ping 快速在线自检：不调用 AI、零费用、不进关系计数。
+    #     回复当前北京时间，确认「QQ 在线 + 机器人进程存活 + 时钟正确」。
+    if re.fullmatch(r"[\\/]ping", question, flags=re.IGNORECASE):
+        now = get_now()
+        reply = f"在。{now.strftime('%H:%M:%S')}（北京时间）"
+        await add_message(
+            group_id=event.group_id,
+            user_id=event.self_id,
+            nickname=BOT_NAME,
+            role="assistant",
+            content=reply,
+        )
+        await chat.finish(reply)
 
     # 0.6 图片提取（v0.5 DIRECT Vision）：白名单已通过才允许读取 image segment。
     #     日志只记数量统计，绝不输出图片 URL / Base64 / CDN token。

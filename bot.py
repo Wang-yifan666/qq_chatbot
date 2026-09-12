@@ -191,6 +191,20 @@ except ValueError as exc:
 
 setup_scheduled_tasks(driver)
 
+# 6.7 离线邮件告警（v0.1）：OneBot Bot 断开超过宽限期 → SMTP 通知管理员。
+#     只监听 connect / disconnect 事件，不判断断开原因；配置不完整时
+#     setup 内部会记 ERROR 并保持关闭（fail-closed），绝不半开。
+try:
+    from services.offline_alert import setup_offline_alert
+except Exception as exc:  # 告警功能绝不能阻断机器人启动
+    logger.error(
+        "[OFFLINE ALERT] 加载 services.offline_alert 失败，离线邮件告警不可用：{}: {}",
+        type(exc).__name__,
+        redact_secrets(str(exc)),
+    )
+else:
+    setup_offline_alert(driver)
+
 # 7. 加载 plugins/ 目录下的全部插件（ai_chat / context_recorder / ambient）。
 nonebot.load_plugins("plugins")
 
