@@ -36,6 +36,12 @@ os.environ["AMBIENT_ENABLED"] = "false"
 os.environ["VISION_ENABLED"] = "true"
 os.environ["VISION_MAX_IMAGES"] = "4"
 os.environ["VISION_DETAIL"] = "auto"
+# v0.6 poke：与代码默认一致地显式开启（个别用例 monkeypatch 模块属性切换）
+os.environ["POKE_ENABLED"] = "true"
+os.environ["POKE_USER_COOLDOWN_SECONDS"] = "10"
+os.environ["POKE_GROUP_COOLDOWN_SECONDS"] = "3"
+os.environ["POKE_POKE_BACK_ENABLED"] = "true"
+os.environ["POKE_POKE_BACK_COOLDOWN_SECONDS"] = "60"
 os.environ.setdefault("AI_PROVIDER", "deepseek")
 os.environ.setdefault("AI_FALLBACK", "")
 

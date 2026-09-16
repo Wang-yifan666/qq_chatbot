@@ -1,9 +1,11 @@
-"""群会话共享状态（v0.4）：DIRECT / AMBIENT / SCHEDULED 三种模式共用。
+"""群会话共享状态（v0.4 → v0.6）：DIRECT / AMBIENT / SCHEDULED / POKE 四种模式共用。
 
-三种模式都可能往同一个群发消息，并且都会读写同群的 Context：
+四种模式都可能往同一个群发消息，并且都会读写同群的 Context：
 - DIRECT（ai_chat，@消息）处理时持锁；
 - AMBIENT（群聊事件主动插话）与 SCHEDULED（定时任务）也持同一把锁，
-  避免 08:00 定时消息与用户 @ 的回复并发写 Context / 并发发消息。
+  避免 08:00 定时消息与用户 @ 的回复并发写 Context / 并发发消息；
+- POKE（v0.6，群聊戳一戳）同样持同一把锁：poke 与 DIRECT / SCHEDULED
+  在同群串行执行，不同群仍然并行。
 
 锁按需创建：dict 读写没有 await，在事件循环内原子，不需要额外的保护锁。
 """
@@ -17,7 +19,7 @@ from dataclasses import field
 class GroupConversationState:
     """一个群的共享会话状态。
 
-    lock：三种模式共用的串行锁（谁先拿到谁先执行）。
+    lock：四种模式共用的串行锁（谁先拿到谁先执行）。
     ambient_*：AMBIENT 模式的防抖 / 频率状态，由 services/ambient.py 维护，
     其他模式不读写。
     """

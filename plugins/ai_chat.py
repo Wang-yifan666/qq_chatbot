@@ -73,6 +73,7 @@ from services.relationship_service import record_direct_interaction
 from services.reply_splitter import SPLIT_REPLY_DELAY_MS
 from services.reply_splitter import SPLIT_REPLY_ENABLED
 from services.reply_splitter import split_reply
+from services.runtime_context import TIMEZONE
 from services.runtime_context import get_now
 from services.user_store import upsert_user
 from services.vision import VISION_ALL_FAILED_REPLY
@@ -150,10 +151,13 @@ async def handle(event: GroupMessageEvent):
     question = event.get_plaintext().strip()
 
     # 0.55 \ping 快速在线自检：不调用 AI、零费用、不进关系计数。
-    #     回复当前北京时间，确认「QQ 在线 + 机器人进程存活 + 时钟正确」。
+    #     回复当前 BOT_TIMEZONE 时间，确认「QQ 在线 + 机器人进程存活 + 时钟正确」。
+    #     v0.6：时间标签与真实时间源一致——Asia/Shanghai 显示「北京时间」，
+    #     其它时区显示真实配置名（绝不硬编码北京时间）。
     if re.fullmatch(r"[\\/]ping", question, flags=re.IGNORECASE):
         now = get_now()
-        reply = f"在。{now.strftime('%H:%M:%S')}（北京时间）"
+        tz_label = "北京时间" if TIMEZONE == "Asia/Shanghai" else TIMEZONE
+        reply = f"在。{now.strftime('%H:%M:%S')}（{tz_label}）"
         await add_message(
             group_id=event.group_id,
             user_id=event.self_id,

@@ -2,16 +2,19 @@
 
 一个运行在 Windows 上的 QQ 群聊 AI 机器人。
 
-**当前版本：v0.5 —— DIRECT Vision MVP**
+**当前版本：v0.6.1 —— Poke Backend Resilience & Deployment Compatibility**
 
 ```
 触发源 A：QQ Message Event                      触发源 B：APScheduler Cron（不依赖任何消息）
   ├─ @夜子 / 回复 → DIRECT（文字 + 可选图片）        └─ morning_greeting 等 ScheduledTask
   └─ 普通群消息 → AMBIENT（安静期+闸门+AI 决策）         → 白名单 → per-group 锁 → claim 幂等
                     ↓                                       ↓
+触发源 C：QQ Notice Event（notice_type=notify, sub_type=poke）
+  └─ target_id == self_id → POKE（白名单 → 防刷 cooldown → 戳回限频）
+                    ↓
         统一 Conversation Generation Pipeline
         ① 群访问白名单（fail-closed：非白名单群到此为止，不读/不存/不回，也不读图片）
-        ② 唯一 Persona Core（本地 persona.txt / PERSONA_FILE，三模式共用）
+        ② 唯一 Persona Core（本地 persona.txt / PERSONA_FILE，四模式共用）
         ③ 程序生成可信状态（conversation_mode / 日期时间 / capabilities）
         ④ 上下文 DATA（JSON 转义，带 Context Budget；图片只以文字占位符入库）
         ⑤ Persona RAG：角色语料 → 本地 NumPy 索引 → 动态过滤 → 检索 →
@@ -19,9 +22,10 @@
         ⑥ 安全规则 + 信任模型 + 人格锚点（图片内容 = 不可信用户数据）
         ⑦ DIRECT 视觉（v0.5）：最后一个 user 消息附加 image_url block
            → capability-aware 路由（图片只发给 deepseek-flash）
-        ⑧ 需要时调用 web_search 工具（白名单 + Schema 校验；Scheduled/AMBIENT 默认无工具）
+        ⑧ 需要时调用 web_search 工具（白名单 + Schema 校验；Scheduled/AMBIENT/POKE 默认无工具）
         ⑨ DeepSeek / 智谱 GLM（失败自动 fallback，同一 messages）
         ⑩ 主动模式：QQ 主动发送 → assistant 写入 Context；DIRECT：按自然段拆分回复
+        ⑪ POKE（v0.6）：一句话短回复 + 程序决定是否戳回 → 结构化占位写入 Context
 ```
 
 机器人能理解“这个”“那个”“刚才说的”“你刚才第二点是什么意思”“继续说”这类
@@ -62,6 +66,11 @@ QQ 服务器 / NapCat（OneBot 11 协议）                     morning_greeting
 │     → LLM 决策 {"should_reply": bool}（允许沉默）→ 主动生成 → 发送 → 写 Context
 │     DIRECT 到来时立即取消本群 pending ambient
 │
+├─ plugins/poke.py（notice 事件，v0.6 戳一戳/拍一拍）
+│     PokeNotifyEvent（notice_type=notify, sub_type=poke）→ 白名单最先
+│     → POKE_ENABLED → 只处理群聊 → target_id == self_id（只处理“有人戳机器人”）
+│     → cancel AMBIENT → per-group 锁 → 防刷 cooldown → POKE 生成 → 短文本/戳回 → 写 Context
+│
 ├─ plugins/ai_chat.py（priority=10, block=True，只有 @机器人 才触发）
 │     ⓪ 群访问白名单检查：未授权群直接丢弃（不回复、不调 AI、不落库）
 │     ① upsert 用户身份（user_id 稳定身份，nickname 只是显示名）
@@ -79,7 +88,7 @@ QQ 服务器 / NapCat（OneBot 11 协议）                     morning_greeting
 │     ⑫ 后台异步 LLM 提取长期记忆（失败只记日志，不阻塞回复）
 │     ⑬ 回答沿原路返回 → NoneBot2 → WebSocket → NapCat → QQ群回复
 │
-└─ 三种模式共用：per-group 锁（services/group_conversation.py）+
+└─ 四种模式共用：per-group 锁（services/group_conversation.py）+
    唯一 Persona Core（prompt_builder.CORE_PERSONA ← 本地 persona.txt）
 ```
 
@@ -163,12 +172,12 @@ Scheduler / 事件只决定**是否触发**；**怎么说**永远由本地人格
   生成管线 → 主动发送 → 写 Context。绝不每条普通消息都回复、没有“每 N 条随机说一次”；
   决策面向“是否存在适合这个角色加入的机会”（吐槽/情绪/玩笑/接话点/提到夜子/
   已有连续性），而不是只做知识型回答；**怎么说仍完全由本地 Persona 决定**；
-- **三种模式共用同一个 Persona Core**（`prompt_builder.CORE_PERSONA`，唯一读取
+- **四种模式共用同一个 Persona Core**（`prompt_builder.CORE_PERSONA`，唯一读取
   `persona.txt` 的地方），共用 `services/group_conversation.py` 的 per-group 锁与
   `services/llm_client.py` 的统一 Provider/fallback。Persona RAG 永远只是表达参考，
   不能覆盖本地 Persona Core；本地人格与内置默认冲突时以本地人格为准（修改后重启生效）。
   **capability 按本次真实能力生成**：只有 DIRECT 实际提供 web_search 工具时才在
-  Prompt 说 true；Scheduled / Ambient 默认无工具，Prompt 永远说 false——不会出现
+  Prompt 说 true；Scheduled / Ambient / Poke 默认无工具，Prompt 永远说 false——不会出现
   “全局开了搜索、模型以为能用、实际没有 tools”的不一致。
 
 **新增一个定时任务（三步）**：`services/scheduled_tasks.py` 的
@@ -235,6 +244,176 @@ VISION_MAX_IMAGES=4            # 单次最多交给模型的图片数（1~10）
 VISION_DETAIL=auto             # OpenAI detail 参数：auto | low | high
 VISION_MAX_IMAGE_BYTES=10485760  # 单图大小上限（NapCat 提供 file_size 时校验，默认 10MB）
 ```
+
+## 拍一拍 / 戳一戳（POKE，v0.6）
+
+QQ 的“戳一戳 / 拍一拍”在 OneBot v11 里是 notice 事件
+（`notice_type=notify, sub_type=poke`），本项目直接使用
+`nonebot-adapter-onebot.v11` 自带的 `PokeNotifyEvent`，不自己解析原始 JSON。
+
+### 事件过滤规则（fail-closed）
+
+| 情况 | 处理 |
+| --- | --- |
+| 非白名单群（`ALLOWED_GROUP_IDS` 之外） | 处理器最前面直接丢弃：不读 Context / Memory、不建立用户、不调用模型、不写数据库、不发送文字、不执行 group_poke，不产生任何额外副作用 |
+| `POKE_ENABLED=false` | 完全忽略 |
+| 私聊 poke（`group_id` 为空） | 忽略（v0.6 只支持群聊 poke） |
+| `target_id != self_id`（群友互戳 / 被戳的不是机器人） | 忽略 |
+| `user_id == self_id`（机器人戳别人产生的通知） | 忽略，杜绝机器人之间或自身触发的 poke 循环 |
+| 有人戳机器人（`target_id == self_id`，白名单群） | 进入 POKE pipeline |
+
+### POKE 工作流程
+
+```
+QQ Notice Event（notify/poke）
+  → target_id == self_id
+  → 群白名单（fail-closed）
+  → POKE_ENABLED
+  → cancel_pending_ambient（poke 是明确针对机器人的互动）
+  → per-group 锁（与 DIRECT / AMBIENT / SCHEDULED 同一把：同群串行、异群并行）
+  → 防刷 cooldown（用户级 + 群级，内存态）
+  → relationship / Relationship Context（affection）/ 最近群聊 Context /
+    可信 runtime time / Persona RAG
+  → POKE generation（conversation_mode=poke，唯一 Persona Core）
+  → 回应：最多 1 条短文本 + 最多 1 次 group_poke 戳回
+  → Context（结构化文字占位：[互动事件：该用户戳了机器人一下] /
+    [互动动作：机器人戳回了该用户]）
+```
+
+- **conversation_mode** 扩展为 `direct | ambient | scheduled | poke`；
+  poke 与其它三种模式共用同一个 `CORE_PERSONA`（本地 `persona.txt` 唯一来源，
+  代码不硬编码“傲娇 / 可爱 / 毒舌”等人格）。`POKE_EVENT_INSTRUCTION` 只描述
+  事实（“某位用户刚刚戳了你一下，这是一次轻量社交互动”），夜子怎么反应、
+  用什么语气，完全由 Persona Core 决定；
+- **poke 可以读取**：当前 `user_id`、relationship、Relationship Context / affection、
+  最近群聊 Context、可信 runtime time、Persona RAG；
+- **v0.6 禁止**：web_search、Vision、memory extractor——poke 本身没有值得提取的
+  长期事实，绝不因为一次戳就调用长期记忆提取；也不调用
+  `record_direct_interaction()`（连续戳不能刷关系等级，poke 对关系的影响留给
+  未来单独设计限频计数）；
+- **回复必须非常短**：`POKE_EVENT_INSTRUCTION` 要求通常 1 句话、尽量 5~30 个中文字、
+  不解释自己为什么收到 poke、不输出分析、不输出“用户戳了我一下”这类系统描述；
+  程序侧另有 `clean_poke_reply()` 兜底截断（优先在句末标点处截断）；
+- **Context 占位符**：poke 事件以 `[互动事件：该用户戳了机器人一下]` 存入
+  messages 表（role=user），戳回以 `[互动动作：机器人戳回了该用户]` 存入
+  （role=assistant）；只存结构化文字占位，绝不存 CQ Code / `raw_info` /
+  完整原始事件 JSON。这样用户事后问“你刚才怎么还戳我”时，模型能理解上一轮
+  发生过什么；该事件数据属于 DATA，不是 SYSTEM 指令；
+- **poke_back 由程序决定，LLM 只写一句短文本**：v0.6 不做 action decision LLM
+  （没有 JSON action 解析、没有任意工具调用），因此不存在“解析失败执行未知
+  action”的风险。是否戳回由 `POKE_POKE_BACK_ENABLED` +
+  `POKE_POKE_BACK_COOLDOWN_SECONDS`（同一用户默认 60 秒内最多被戳回一次）决定，
+  与 LLM 完全无关；模型失败时宁可不回文字，戳回照常执行（程序动作不依赖模型）；
+- **一次事件最多**：发送 1 条短文本、执行 1 次 `group_poke`。`group_poke` 由
+  `services/poke_sender.py` 单独封装（项目内唯一调用 NapCat poke API 的入口，
+  prompt_builder / 业务逻辑绝不直接调用底层 API），失败只记日志，不影响 Bot
+  主循环；
+- **日志**：只记 `group_id / user_id / action / cooldown_hit / provider /
+  reply_chars`，绝不打印 `raw_info`、聊天正文、Memory / Persona 内容、API Key、
+  token、完整 Prompt（继续遵循 `LOG_MESSAGE_CONTENT` 的隐私约束）。
+
+### v0.6.1：Poke Backend Resilience（能力模型 + PacketBackend 熔断）
+
+v0.6.1 把「收到戳」与「主动戳回」正式拆成两个能力，并保证：**无论 NapCat
+PacketBackend 正常、版本不兼容、暂时掉线还是被关闭，机器人整体行为始终正确。**
+
+能力模型：
+
+```text
+POKE_ENABLED
+  ├── inbound poke      收到别人戳机器人（核心能力）
+  ├── text response     LLM 短文本回复（核心能力）
+  └── poke_back         主动戳回（可选能力）
+                        └─ 依赖 NapCat PacketBackend 发包能力
+```
+
+- **收到戳 + 文字回复 = 核心能力**：只要 `POKE_ENABLED` 就工作，不受任何
+  后端能力影响；`group_poke` 失败绝不导致 POKE 处理器提前退出；
+- **戳回 = 可选能力**：由 `services/poke_sender.py` 单独封装，内部维护三态熔断
+  （`UNKNOWN → AVAILABLE / OPEN →(TTL 1800s)→ HALF_OPEN`，几十行实现，无第三方库）。
+  首次真实戳回需求到来时才探测（lazy detection，绝不主动 group_poke 任何人做
+  “健康检查”）；探测锁保证同一时刻最多一个探测，`AVAILABLE` 状态下多群正常并行；
+- **错误分类保守**：只有 `retcode=1400` **且** wording/message 含 `packetbackend`
+  语义才判定为 BACKEND_UNAVAILABLE 并打开熔断；普通 ActionFailed / timeout /
+  WS 瞬断都不开熔断；**绝不做 `send_poke` 别名 fallback**（换 action 名解决不了
+  PacketBackend 本身不可用，只会产生双倍错误与双倍 API 调用）；
+- **Context 诚实性**：只有 `result.ok` 才写 `[互动动作：机器人戳回了该用户]`
+  并记录社交限频时间戳——失败 / 熔断跳过绝不写“戳回了”，避免模型下一轮
+  产生“我明明戳了”的事实幻觉；基础设施错误只进日志，不进聊天 Context；
+- **日志分级**：首次 backend unavailable / 开熔断 → WARNING（结构化，
+  `retcode` + `reason=packet_backend_unsupported`，无 stacktrace / wording 原文）；
+  熔断期间的跳过 → DEBUG；恢复 / 探测成功 → INFO。
+
+**版本配对说明**：PacketBackend 的偏移数据按「QQ build × CPU 架构 × NapCat 版本」
+三元组匹配。NapCat v4.18.19 官方 release 对 Linux ARM64 列出的推荐 build 是
+**44343**；`3.2.33-52892` 属于“未内置、通过 Major 兜底”的新版本，`group_poke`
+会返回 `retcode=1400`（packetBackend 不支持）。判断兼容性的优先级：
+NapCat 启动日志的 PacketHandler 偏移警告 ＞ 错误信息指引的 release/tag ＞
+对应 GitHub Release ＞ 静态文档版本表。树莓派部署时应固定 QQ 版本
+（`apt-mark hold linuxqq`）防止自动更新破坏配对。
+
+### POKE 环境变量（.env，均有默认值与范围校验，非法值安全回落）
+
+```ini
+# ===== Poke interaction (v0.6, QQ 戳一戳 / 拍一拍；notice_type=notify, sub_type=poke) =====
+# 总开关（默认 true）；关闭时机器人对戳一戳完全静默
+POKE_ENABLED=true
+# 用户级防刷：同一用户连续戳的冷却秒数（1~3600，默认 10）
+POKE_USER_COOLDOWN_SECONDS=10
+# 群级防刷：全群共用（不同用户也共用）的冷却秒数（0~3600，默认 3；0=关闭）
+POKE_GROUP_COOLDOWN_SECONDS=3
+# 是否允许机器人戳回去（默认 true）
+POKE_POKE_BACK_ENABLED=true
+# 戳回限频：同一用户被戳回的最小间隔秒数（0~86400，默认 60；0=不限）
+POKE_POKE_BACK_COOLDOWN_SECONDS=60
+# 短回复最大字符数（10~200，默认 60；程序侧兜底截断，防止长篇回答）
+POKE_MAX_REPLY_CHARS=60
+```
+
+## 时间语义（v0.6，Time Semantics Hardening）
+
+“时间是多少”和“属于什么时段”都由程序确定，不让 LLM 自己推理：
+
+- **唯一时间来源**：`services.runtime_context.get_now()` 是整个项目唯一的当前时间
+  来源（`BOT_TIMEZONE` 时区，默认 `Asia/Shanghai`），代码中不允许出现第二套
+  `datetime.now()` 时间源；
+- **24 小时制是唯一主字段**：`build_runtime_state()` 除原有 `timezone / date /
+  datetime / weekday / now_epoch` 外，新增机器可读字段
+  `time_24h`（如 `02:23:15`）/ `hour_24` / `minute` / `day_period`；所有
+  datetime / time_24h 都是 24 小时制，Prompt 中明确写出：
+  `00:xx` 表示午夜之后的凌晨（不是下午 12 点）、`02:xx` 表示凌晨 2 点
+  （不是下午 2 点）、`12:xx` 表示中午 12 点（不是午夜 0 点）、`13:xx` 表示
+  下午 1 点、`18:xx` 表示晚上 6 点；
+- **day_period 由程序集中计算**：`classify_day_period(hour)` 是整个项目唯一的
+  时段边界定义（prompt_builder / scheduled_tasks / ai_chat 都不允许各写一套）：
+
+  | 小时（24 小时制） | day_period |
+  | --- | --- |
+  | 00:00~04:59 | 凌晨 |
+  | 05:00~08:59 | 早上 |
+  | 09:00~11:59 | 上午 |
+  | 12:00~12:59 | 中午 |
+  | 13:00~17:59 | 下午 |
+  | 18:00~22:59 | 晚上 |
+  | 23:00~23:59 | 深夜 |
+
+- **12 小时制只是辅助**：`hour_12 / meridiem` 作为辅助字段同时提供
+  （明确约定 `00:00 = 12:00 AM`、`12:00 = 12:00 PM`），但默认 Prompt 优先使用
+  `time_24h / hour_24 / day_period`，绝不替换 24 小时制主字段；如需自然语言
+  描述时间，优先使用程序给出的 `day_period`，不允许自行重新推断 AM/PM；
+- **四种模式同一时间语义**：DIRECT / AMBIENT / SCHEDULED / POKE 的 runtime state
+  最终都来自 `get_now()` / `build_runtime_state()`；`ScheduledEvent.local_datetime`
+  与 runtime state 使用同一个 `now`（scheduled 执行时显式传入
+  `build_runtime_state(now)`），不存在第二套“当前时间解释”；
+- **scheduled 的 HH:MM 继续按 24 小时制解析**：`00:00 / 08:00 / 12:00 / 23:59`
+  合法（小时 0~23），`24:00` 继续非法（启动报错退出）；
+- **BOT_TIMEZONE fallback 透明化**：未配置时继续默认 `Asia/Shanghai`
+  （requirements.txt 已含 tzdata，Windows 可正常使用 IANA 时区）。无论是否发生
+  fallback，日志都同时给出 `configured_timezone` 与 `actual_timezone`——
+  配置了 Asia/Shanghai 实际却跑在 UTC 的隐蔽错误一眼可见：
+  `[WARNING] [RUNTIME] BOT_TIMEZONE fallback: configured_timezone=... actual_timezone=...`；
+- **\ping 标签与真实时间源一致**：`Asia/Shanghai` 时显示「北京时间」，其它时区
+  显示真实配置名（如 `在。02:23:10（Asia/Shanghai）`），不再硬编码北京时间。
 
 ## 功能范围
 
@@ -313,11 +492,11 @@ VISION_MAX_IMAGE_BYTES=10485760  # 单图大小上限（NapCat 提供 file_size 
 - 数据库异常降级：SQLite 读写失败只记日志，Bot 退化为单轮问答继续运行
 - 启动时缺少所用服务商的 API Key（`DEEPSEEK_API_KEY` / `ZHIPU_API_KEY`）直接报错退出，而不是运行中才报错
 - **主动行为双触发系统（v0.4）**：
-  - `conversation_mode = direct | ambient | scheduled` 统一由 `prompt_builder` 构造；
+  - `conversation_mode = direct | ambient | scheduled | poke` 统一由 `prompt_builder` 构造；
     direct 输出与 v0.3.1 完全一致；ambient/scheduled 没有 current_user / current_question，
     只有可信触发事件与（可选）最近群聊上下文 DATA；
   - **唯一 Persona Core**：`prompt_builder.CORE_PERSONA` 是唯一读取
-    `PERSONA_FILE`（默认本地 `persona.txt`）的地方，三种模式共用，代码不硬编码任何
+    `PERSONA_FILE`（默认本地 `persona.txt`）的地方，四种模式共用，代码不硬编码任何
     性格形容词、不复制人格 Prompt、不维护固定早安文案；Persona RAG 只作表达参考，
     永远不覆盖 Persona Core；
   - **Scheduled**：`nonebot-plugin-apscheduler` 真实 Cron（`BOT_TIMEZONE` 时区，
@@ -335,10 +514,10 @@ VISION_MAX_IMAGE_BYTES=10485760  # 单图大小上限（NapCat 提供 file_size 
     吐槽/情绪/玩笑/接话点/提到夜子；允许沉默，解析失败按沉默）→ 通过才进入统一
     生成管线 → 主动发送 → 写 Context；绝不对每条普通消息回复，没有随机
     “每 N 条说一次”；DIRECT 到来时立即取消 pending ambient；
-  - 三种模式共用 `services/group_conversation.py` 的 per-group 锁（DIRECT > AMBIENT，
-    Scheduled 到点后等锁、拿到锁再确认）与 `services/llm_client.py` 的统一
+  - 四种模式共用 `services/group_conversation.py` 的 per-group 锁（DIRECT > AMBIENT，
+    Scheduled / Poke 到点后等锁、拿到锁再确认）与 `services/llm_client.py` 的统一
     Provider / fallback；白名单（fail-closed）对主动发送同样生效；
-    capability Prompt 按本次真实提供的 tools 生成（Scheduled/Ambient 恒为
+    capability Prompt 按本次真实提供的 tools 生成（Scheduled/Ambient/Poke 恒为
     web_search=false，与它们实际没带工具一致）。
 - **DIRECT 视觉理解（v0.5）**：@夜子 + 图片（最多 4 张，`VISION_MAX_IMAGES`），
   由 `services/vision.py` 统一提取 OneBot image segment 并校验（URL / file_size /
@@ -349,6 +528,23 @@ VISION_MAX_IMAGE_BYTES=10485760  # 单图大小上限（NapCat 提供 file_size 
   直接跳过，绝不删图硬发；纯图片 @ 正常进入 pipeline（文本块只表达程序事实）；
   Context 只存 `[附带 N 张图片]` 占位符，日志只记数量；视觉同样受 fail-closed
   白名单保护（未授权群连图片 segment 都不读取）。详见「视觉理解」章节。
+- **POKE 互动（v0.6）**：群聊“戳一戳 / 拍一拍”（`PokeNotifyEvent`，
+  `notice_type=notify, sub_type=poke`）→ 只处理 `target_id == self_id`（有人戳机器人），
+  机器人戳别人 / 群友互戳 / 私聊 poke 全部忽略，绝不回环；白名单 fail-closed 最先
+  判断；`cancel_pending_ambient` → 与其它三模式共用 per-group 锁 → 用户级（默认 10s）
+  + 群级（默认 3s）防刷 cooldown → relationship / Relationship Context / 最近群聊
+  Context / runtime time / Persona RAG → `conversation_mode=poke` 生成（唯一 Persona
+  Core，无工具 / 无视觉 / 无记忆提取 / 不刷关系等级）→ 最多 1 条短文本
+  （程序侧兜底截断）+ 程序决定的最多 1 次 `group_poke` 戳回（独立限频，默认 60s）；
+  互动事件与戳回动作以结构化文字占位写入 Context（绝不存 CQ Code / raw_info）；
+  详见「拍一拍 / 戳一戳（POKE，v0.6）」章节。
+- **时间语义加固（v0.6）**：`build_runtime_state()` 新增 `time_24h / hour_24 /
+  minute / day_period`（+ 辅助 `hour_12 / meridiem`）机器可读字段，24 小时制规则
+  显式写进 Prompt；`classify_day_period(hour)` 是整个项目唯一的时间段边界定义
+  （凌晨/早上/上午/中午/下午/晚上/深夜），四种模式看到同一时间语义；
+  BOT_TIMEZONE 无论是否 fallback 都记录 configured_timezone 与 actual_timezone；
+  `\ping` 标签与真实时区一致（Asia/Shanghai 显示「北京时间」，其它时区显示配置名）；
+  详见「时间语义（v0.6）」章节。
 
 暂不实现（保持范围小）：
 
@@ -401,7 +597,7 @@ qq_ai_bot/
 │   ├── conftest.py            # 隔离环境：临时 SQLite 路径 + 关闭 RAG/拆分/搜索/主动行为
 │   ├── test_group_access.py   # 白名单解析 + fail-closed 语义 + 非法配置导入报错
 │   ├── test_group_gate.py     # 未授权群零副作用 / 授权群正常流程 / ambient 门禁 / cron 注册
-│   ├── test_group_conversation.py  # 三模式共享 per-group 锁 + AMBIENT 频率状态（v0.4）
+│   ├── test_group_conversation.py  # 四模式共享 per-group 锁 + AMBIENT 频率状态（v0.4）
 │   ├── test_prompt_builder_modes.py # direct 不变 + scheduled/ambient 结构 + Persona 单一来源（v0.4）
 │   ├── test_scheduled_config.py    # MORNING_GREETING_TIME 解析 / catch-up 窗口 / 非法配置报错（v0.4）
 │   ├── test_scheduled_task_store.py# claim 幂等 + 状态更新 + has_recent_bot_message（v0.4）
@@ -410,6 +606,8 @@ qq_ai_bot/
 │   ├── test_vision.py             # 图片提取/限制/attach/占位符/纯函数（v0.5）
 │   ├── test_llm_vision_fallback.py# capability-aware fallback：视觉请求只发给视觉模型（v0.5）
 │   ├── test_model_config.py       # DeepSeek 默认模型 = deepseek-flash 基线（v0.5）
+│   ├── test_poke.py               # POKE 门禁/防刷/戳回/失败降级/并发/Prompt 结构（v0.6）
+│   ├── test_runtime_time.py       # day_period 边界 / runtime state / 四模式同源时间语义（v0.6）
 │   ├── test_reply_splitter.py # 回复拆分（短文本 / 段落 / 代码块 / 上限 / 极端输入）
 │   ├── test_tool_orchestrator.py  # web_search 参数校验 + 工具白名单 + 次数/轮数上限（mock 搜索）
 │   └── test_relationship_service.py # calculate_base_level 阈值（永不产生 close）
@@ -430,18 +628,21 @@ qq_ai_bot/
 │   ├── ai_chat.py         # DIRECT：@机器人 处理：群白名单 → 读历史 → 检索记忆 → Persona RAG →
 │   │                      #   构造 Prompt → 统一 LLM 层（主备）→ 存回答 → 回复；共享 per-group 锁
 │   ├── context_recorder.py# 记录白名单群纯文本消息（priority=20, 不回复）
-│   └── ambient.py         # AMBIENT（v0.4，priority=30）：普通消息 → services/ambient.py 调度
+│   ├── ambient.py         # AMBIENT（v0.4，priority=30）：普通消息 → services/ambient.py 调度
+│   └── poke.py            # POKE（v0.6）：PokeNotifyEvent 门禁 → services/poke.py
 │
 └── services/
     ├── __init__.py            # redact_secrets + 日志隐私开关（v0.3.1）
     ├── group_access.py        # 群聊访问白名单：ALLOWED_GROUP_IDS 解析 + is_group_allowed（v0.3.1）
-    ├── group_conversation.py  # 群会话共享状态：DIRECT/AMBIENT/SCHEDULED 共用 per-group 锁（v0.4）
+    ├── group_conversation.py  # 群会话共享状态：DIRECT/AMBIENT/SCHEDULED/POKE 共用 per-group 锁（v0.4→v0.6）
     ├── vision.py              # QQ 图片 → 模型 image input：提取/限制/attach/占位符（v0.5）
     ├── llm_client.py          # 统一 LLM 调用层：capability-aware fallback/工具编排（v0.4→v0.5）
     ├── proactive_sender.py    # 主动发送：OneBot Bot 查找 + send_group_msg + assistant 入库（v0.4）
     ├── scheduled_tasks.py     # ScheduledTask 抽象 + morning_greeting cron + catch-up（v0.4）
     ├── scheduled_task_store.py# scheduled_task_runs：原子 claim / 状态更新（幂等，v0.4）
     ├── ambient.py             # AMBIENT：debounce + cheap gate + 决策 + ambient 生成管线（v0.4）
+    ├── poke.py                # POKE：防刷 cooldown + 戳回限频 + poke 生成管线（v0.6）
+    ├── poke_sender.py         # POKE 发送：group_poke 唯一封装 + PacketBackend 三态熔断（v0.6→v0.6.1）
     ├── database.py            # SQLite 唯一入口：连接 + 全部建表/索引（含 scheduled_task_runs，WAL）
     ├── context_store.py       # messages：群聊短期上下文读写 + has_recent_bot_message
     ├── user_store.py          # users：用户身份（user_id 稳定身份）
@@ -451,14 +652,14 @@ qq_ai_bot/
     ├── personal_memory_store.py # 个人资料键值库（data/qq_ai_bot.db，管理员维护）
     ├── memory_retriever.py   # Mini-RAG 检索：规则评分 + Memory Context 格式化
     ├── affection_store.py    # 好感度存取 + Relationship Context 构造（v0.2.6）
-    ├── runtime_context.py    # 可信运行时状态：日期/时间/时区（v0.2.3）
+    ├── runtime_context.py    # 可信运行时状态：日期/时间/时区 + day_period（v0.2.3→v0.6）
     ├── context_serializer.py # 结构化 JSON 历史 + Context Budget + 无提问者的群历史 DATA（v0.4）
     ├── web_search.py         # 联网搜索后端（bing / duckduckgo，统一接口）（v0.2.3）
     ├── tool_orchestrator.py  # 工具白名单 + Schema 校验 + 调用循环（v0.2.3）
     ├── reply_splitter.py     # 自然段拆分回复（防刷屏）（v0.2.3）
     ├── embedding_backend.py  # 可替换 EmbeddingBackend + 进程级单例（模型只加载一次）（v0.3.0）
     ├── persona_rag.py        # Persona RAG：过滤/检索/rerank/diversity → PersonaReference（v0.3.0）
-    ├── prompt_builder.py      # 唯一 Persona Core 来源 + 安全规则 + conversation_mode 构造（v0.4）
+    ├── prompt_builder.py      # 唯一 Persona Core 来源 + 安全规则 + conversation_mode 构造（v0.4→v0.6）
     ├── deepseek.py            # DeepSeek 纯 LLM Transport + ask_deepseek(messages)
     └── zhipu.py               # 智谱 GLM 纯 LLM Transport + ask_glm(messages)
 ```
@@ -649,7 +850,7 @@ AMBIENT_MAX_PER_HOUR=3
 AMBIENT_MIN_MESSAGE_CHARS=4
 
 # ===== Vision (v0.5, DIRECT only; deepseek-flash 原生支持图片) =====
-# 让夜子真正“看到”@她时同时发送的图片（AMBIENT / SCHEDULED 不读图片）
+# 让夜子真正“看到”@她时同时发送的图片（AMBIENT / SCHEDULED / POKE 不读图片）
 VISION_ENABLED=true
 # 单次请求最多交给模型的图片数（1~10，默认 4；超出忽略）
 VISION_MAX_IMAGES=4
@@ -657,6 +858,20 @@ VISION_MAX_IMAGES=4
 VISION_DETAIL=auto
 # 单图大小上限（字节；NapCat 提供 file_size 时校验，默认 10MB = 10485760）
 VISION_MAX_IMAGE_BYTES=10485760
+
+# ===== Poke interaction (v0.6, QQ 戳一戳 / 拍一拍；notice_type=notify, sub_type=poke) =====
+# 总开关（默认 true）；关闭时机器人对戳一戳完全静默
+POKE_ENABLED=true
+# 用户级防刷：同一用户连续戳的冷却秒数（1~3600，默认 10）
+POKE_USER_COOLDOWN_SECONDS=10
+# 群级防刷：全群共用（不同用户也共用）的冷却秒数（0~3600，默认 3；0=关闭）
+POKE_GROUP_COOLDOWN_SECONDS=3
+# 是否允许机器人戳回去（默认 true）
+POKE_POKE_BACK_ENABLED=true
+# 戳回限频：同一用户被戳回的最小间隔秒数（0~86400，默认 60；0=不限）
+POKE_POKE_BACK_COOLDOWN_SECONDS=60
+# 短回复最大字符数（10~200，默认 60；程序侧兜底截断，防止长篇回答）
+POKE_MAX_REPLY_CHARS=60
 
 # ===== Persona RAG (v0.3.0, NumPy 本地索引，无向量数据库) =====
 # 角色人格语料检索开关
@@ -1238,12 +1453,13 @@ python -m compileall bot.py plugins services scripts tests
   `user_memories`；授权群正常进入流程（AI 层用桩替代）；ambient 插件门禁；
   morning_greeting cron 真实注册（trigger=08:00 Asia/Shanghai、coalesce、
   max_instances=1、misfire_grace_time）；
-- `test_group_conversation.py`（v0.4）：DIRECT / AMBIENT / SCHEDULED 共享同一把
-  per-group 锁（拿到锁的第二个协程必须等待）与 AMBIENT 频率状态；
+- `test_group_conversation.py`（v0.4）：DIRECT / AMBIENT / SCHEDULED（v0.6 起
+  含 POKE）共享同一把 per-group 锁（拿到锁的第二个协程必须等待）与 AMBIENT 频率状态；
 - `test_prompt_builder_modes.py`（v0.4）：direct 输出与旧版完全一致；
   scheduled / ambient 无 current_user、无伪造提问者；本地 `persona.txt` 就是
-  `CORE_PERSONA`（Persona 单一来源），三种模式共用；定时/插话指令不含
-  “活泼/傲娇/毒舌/可爱/温柔”等硬编码性格；
+  `CORE_PERSONA`（Persona 单一来源），各模式共用；定时/插话指令不含
+  “活泼/傲娇/毒舌/可爱/温柔”等硬编码性格（poke 指令的同类断言在
+  `test_poke.py`）；
 - `test_scheduled_config.py`（v0.4）：`MORNING_GREETING_TIME` 解析（08:00 合法，
   24:00 等非法启动报错）、catch-up 窗口（07:59 不触发 / 08:10 补执行 /
   10:30 不补 / 时区正确）；
@@ -1269,6 +1485,21 @@ python -m compileall bot.py plugins services scripts tests
 - `test_group_gate.py`（v0.5 扩展）：未授权群带图 @ → 图片 segment 不被读取
   （白名单在任何提取之前）、纯图片 @ 进入 pipeline、图文混合、多图截断、
   `VISION_ENABLED=false` 的稳定降级；
+- `test_poke.py`（v0.6）：poke 门禁矩阵（target≠机器人 / 机器人戳别人 / 私聊 /
+  非白名单群 / `POKE_ENABLED=false` 全部忽略）、用户级与群级 cooldown、戳回限频、
+  LLM 失败 / `group_poke` API 失败 / 数据库异常全部不崩溃、pending AMBIENT 取消、
+  两个群互不阻塞、同群 DIRECT 与 POKE 串行、poke 绝不调用
+  `record_direct_interaction()` 与 memory extractor、poke Prompt 结构
+  （唯一 Persona Core / 无工具 / 无“当前提问者”/ 结构化互动事件 DATA /
+  `POKE_EVENT_INSTRUCTION` 不含硬编码性格）；
+- `test_runtime_time.py`（v0.6）：`classify_day_period` 全边界
+  （00:00 / 00:30 / 02:30 / 04:59 / 05:00 / 08:59 / 09:00 / 11:59 / 12:00 /
+  12:30 / 12:59 / 13:00 / 17:59 / 18:00 / 22:59 / 23:00 / 23:59；02:30→凌晨、
+  12:30→中午、13:30→下午）、`to_12h` 约定（00:00=12 AM、12:00=12 PM）、
+  `build_runtime_state()` 的 `time_24h / hour_24 / minute / day_period /
+  hour_12 / meridiem` 字段与 24 小时制规则文本、DIRECT / AMBIENT / SCHEDULED /
+  POKE 四模式看到同一份时间语义、scheduled HH:MM 按 24 小时制解析
+  （00:00 / 08:00 / 12:00 / 23:59 合法，24:00 继续非法）；
 - `test_tool_orchestrator.py`（v0.5 扩展）：带图片的 user content 在工具轮次中
   保持完整（不丢失 / 不字符串化）；
 - `test_reply_splitter.py`：短文本不拆 / 自然段拆分 / max chars / max parts /
@@ -1477,6 +1708,23 @@ NapCat 比 NoneBot 晚连接 / 在任务时间后、catch-up 窗口内（默认 
 **Q：为什么 requirements.txt / .env 的注释是英文？**
 中文 Windows 的默认编码是 GBK，旧版 pip 会按 GBK 读 requirements.txt，UTF-8 中文注释会报
 `UnicodeDecodeError`；pydantic 读 .env 也有类似风险。注释用英文可以从根源上避免。
+
+**Q：更新到 v0.6 后，戳机器人没有反应？**
+先确认：1) 群在白名单里（`ALLOWED_GROUP_IDS`）；2) `POKE_ENABLED=true`（默认开启）；
+3) 是**群聊**里戳机器人本人（私聊戳、群友互戳、机器人戳别人都不会触发）；
+4) 连续快速戳会被用户级（默认 10s）/ 群级（默认 3s）cooldown 静默忽略——
+这是防刷设计，不是故障，日志会出现 `cooldown_hit=user/group`。戳回行为由
+`POKE_POKE_BACK_ENABLED` + `POKE_POKE_BACK_COOLDOWN_SECONDS` 控制（同一用户
+默认 60s 内最多被戳回一次）。日志只记 `group_id / user_id / action / provider /
+reply_chars`，不含事件原始内容。
+
+**Q：机器人说的时间和我看到的不一样 / \ping 时间不对？**
+时间只由 `BOT_TIMEZONE`（默认 `Asia/Shanghai`）决定，与系统时区无关。查看启动日志：
+`[RUNTIME] BOT_TIMEZONE configured_timezone=... actual_timezone=...`——如果两者不一致
+（例如配置了 Asia/Shanghai 却显示 UTC），说明时区名写错或缺少 tzdata 包。
+`\ping` 的标签与真实时间源一致：Asia/Shanghai 显示「北京时间」，其它时区显示
+配置名。模型侧的时段由程序给出的 `day_period`（凌晨/早上/上午/中午/下午/晚上/深夜）
+决定，所有 datetime / time_24h 字段都是 24 小时制。
 
 **Q：想换模型？**
 DeepSeek：改 `.env` 的 `DEEPSEEK_MODEL`（推荐 `deepseek-flash`，支持 text + image；

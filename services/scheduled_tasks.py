@@ -67,6 +67,7 @@ from services.proactive_sender import send_group_message
 from services.prompt_builder import ScheduledEvent
 from services.prompt_builder import build_messages
 from services.runtime_context import TIMEZONE
+from services.runtime_context import build_runtime_state
 from services.runtime_context import get_now
 from services.scheduled_task_store import TERMINAL_STATUSES
 from services.scheduled_task_store import claim_scheduled_task
@@ -390,6 +391,8 @@ async def execute_scheduled_task(
             persona_refs = await _retrieve_persona_refs(task, history)
 
             # 9. conversation_mode=scheduled：没有 current_user / current_question。
+            #    v0.6：runtime state 与本任务使用的同一个 now 生成（ScheduledEvent.
+            #    local_datetime 与 runtime state 来自同一个 get_now()，不产生第二套时间）。
             event = ScheduledEvent(
                 event_type=task.event_type,
                 local_datetime=now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -404,6 +407,7 @@ async def execute_scheduled_task(
                 persona_refs=persona_refs,
                 conversation_mode="scheduled",
                 scheduled_event=event,
+                runtime_state=build_runtime_state(now),
             )
 
             # 10. 统一 LLM 调用：工具权限属于 task capability——
