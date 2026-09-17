@@ -1,5 +1,10 @@
 # DialogueUnit 标注 Schema（v3）
 
+> 本 schema **只用于 Persona RAG 的角色风格语料**（需要 12 个语义标签 + LLM 标注）。
+> 如果你只是想放普通资料文档（PDF / Word / Markdown）让机器人检索，**不需要任何标注**：
+> 直接丢进 `data/knowledge/`，再跑 `python scripts/build_knowledge_rag.py`，
+> 见 `docs/knowledge_rag.md`。
+
 本文件描述 Persona RAG 语料文件（`data/persona_processed/` 下你自己的标注语料，
 已 gitignore，版权数据禁止提交）中每行 DialogueUnit 的字段含义。仓库内只保留本
 schema 文档与自造示例（`docs/persona_examples.jsonl`），不含任何原作台词。

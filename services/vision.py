@@ -284,6 +284,11 @@ def attach_images_to_last_user_message(
 ) -> list[dict]:
     """纯函数：拷贝 messages，把图片 block 附加到最后一个 role=user 消息上。
 
+    **v0.7 起 DIRECT 主链路不再使用本函数**：图片改由
+    services/perception/multimodal_builder.py 按“消息内原始顺序”生成有序
+    text / image_url blocks（`文字A 图片1 文字B 图片2` 不再被重排）。
+    这里保留它作为兼容 / 参考实现（旧调用方式与既有测试基线仍可用）。
+
     - 原 messages 不被修改（主备共用同一结构时由调用方决定何时 attach）；
     - 最后一个 user 消息的字符串 content 变成 [{"type":"text",...}, image_url...]；
     - 图片只允许出现在 role=user；system / assistant / tool 绝不带图片；
@@ -331,3 +336,51 @@ def build_context_text(question: str, image_count: int) -> str:
         return question
     note = f"[附带 {image_count} 张图片]" if question else f"[发送了 {image_count} 张图片]"
     return f"{question}\n{note}" if question else note
+
+
+# ===== v0.7：NormalizedMessage 的统一落库占位符 =====
+
+
+def build_normalized_context_text(
+    text: str = "",
+    *,
+    image_count: int = 0,
+    file_notes: tuple[str, ...] | list[str] = (),
+    forward_notes: tuple[str, ...] | list[str] = (),
+    reply_note: str = "",
+) -> str:
+    """把一条**归一化消息**的感知结果转成 SQLite 占位符（v0.7 唯一入口）。
+
+    绝不写：图片 URL / CDN token / Base64 / 文件正文 / 文件临时路径 /
+    下载 URL / 合并转发正文。只写结构化短占位，例如：
+
+        这个是谁？
+        [回复了一条包含图片的消息（1 张图片）]
+        [发送了图片文件: a.png]
+        [发送了一条合并转发，共 12 个节点]
+
+    顺序固定为：当前文本 → 引用占位 → 转发占位 → 文件占位 → 图片占位，
+    与人类阅读顺序一致（引用在前、附件在后）。
+    """
+    parts: list[str] = []
+    question = (text or "").strip()
+    if question:
+        parts.append(question)
+    if reply_note:
+        parts.append(reply_note)
+    for note in forward_notes:
+        if note:
+            parts.append(note)
+    for note in file_notes:
+        if note:
+            parts.append(note)
+    if image_count > 0:
+        if question or parts:
+            parts.append(f"[附带 {image_count} 张图片]")
+        else:
+            parts.append(f"[发送了 {image_count} 张图片]")
+    if not parts:
+        # 用户只 @ 了机器人、没有任何内容：调用方会走“有什么想问我的？”分支，
+        # 这里给一个稳定的空占位，避免写入空字符串。
+        return ""
+    return "\n".join(parts)

@@ -1,5 +1,16 @@
 # Persona RAG v0 架构说明
 
+> **先分清三套数据**（它们互相独立，别混）：
+>
+> | 模块 | 装什么 | 文档 |
+> | --- | --- | --- |
+> | **Persona RAG**（本文） | 角色**风格语料**（原作台词），回答「她怎么说话」 | 本文 |
+> | 知识库 RAG（v0.9） | **你自备的资料文档**（PDF/Word/MD），回答「资料说了什么」 | `docs/knowledge_rag.md` |
+> | Personal Memory（v0.2.5） | 按 群+人 存的短事实（姓名/爱好/技能） | README「Personal Memory」 |
+>
+> 三者共用 `services/embedding_backend.py` 的**同一个模型单例**（不重复加载模型），
+> 但索引、配置、过滤规则、注入位置全部独立。
+
 本阶段目标：用**你自己的标注语料**（`data/persona_processed/` 下的 JSONL，每行一个
 DialogueUnit；版权数据，已 gitignore，仓库不含任何原作台词）完成
 语料 → embedding → 本地索引 → 动态过滤 → 检索 → rerank → diversity →

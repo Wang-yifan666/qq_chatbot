@@ -22,6 +22,7 @@ from nonebot import logger
 from openai import AsyncOpenAI
 
 from services import redact_secrets
+from services.model_registry import normalize_model_name
 from services.tool_orchestrator import RawCompletion
 
 # DeepSeek 兼容 OpenAI 接口，只需把 base_url 指向 DeepSeek
@@ -34,9 +35,10 @@ DEEPSEEK_TIMEOUT = 60.0
 # 默认模型名从环境变量读取，不散落在业务代码里；未配置时用默认值
 # DeepSeek 当前推荐模型名：deepseek-flash（V4.1 Flash，支持 text + image）；
 # deepseek-chat（V4 Pro 的兼容别名，text-only）。
-# 注意：deepseek-v4-flash-vision-exp 属于上一代 Vision Exp，仅作兼容 alias 保留，
-# 不要作为新功能的模型名。
-DEFAULT_MODEL = os.getenv("DEEPSEEK_MODEL") or "deepseek-flash"
+# 归一化：DEEPSEEK_MODEL 里写 deepseek-v4-flash / deepseek-v4-flash-vision-exp
+# 这类历史 alias 时统一映射到 canonical 名（见 services/model_registry.py），
+# 保证“配置的模型”和“本地视觉能力判断”永远看同一个名字。
+DEFAULT_MODEL = normalize_model_name(os.getenv("DEEPSEEK_MODEL")) or "deepseek-flash"
 
 _client: AsyncOpenAI | None = None
 
@@ -71,7 +73,7 @@ async def call_deepseek(
     Transport 层一律原样透传，绝不做 str() / json.dumps 转换。
     任何失败返回 None（异常只记日志，Bot 不崩溃）。
     """
-    selected_model = model or DEFAULT_MODEL
+    selected_model = normalize_model_name(model) or DEFAULT_MODEL
     try:
         kwargs: dict = {}
         if tools:

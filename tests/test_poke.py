@@ -617,6 +617,92 @@ class TestPokePrompt:
         assert poke_messages[0]["content"].startswith(CORE_PERSONA)
 
 
+class TestRecentPokeCount:
+    """v0.8：连续 poke 必须能被“数出来”，否则反应只能靠随机或复读。
+
+    事实来源是 Context 表里已有的 poke 占位符（不是新增计数器）：
+    每次 poke 都会写入 role=user 的 POKE_EVENT_CONTEXT_PLACEHOLDER。
+    """
+
+    @staticmethod
+    def _poke_msg(user_id: int, created_at: str, content: str | None = None):
+        from services.context_store import ChatMessage
+
+        return ChatMessage(
+            id=hash((user_id, created_at, content)) % 100000,
+            group_id=111,
+            user_id=user_id,
+            nickname="小明",
+            role="user",
+            content=POKE_EVENT_CONTEXT_PLACEHOLDER if content is None else content,
+            created_at=created_at,
+        )
+
+    def _now(self) -> str:
+        from datetime import datetime
+        from datetime import timezone
+
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    def test_counts_only_this_users_pokes(self):
+        history = [
+            self._poke_msg(1001, self._now()),
+            self._poke_msg(1002, self._now()),  # 别人的 poke 不算
+            self._poke_msg(1001, self._now()),
+        ]
+        assert poke.count_recent_pokes(history, 1001) == 2
+
+    def test_ignores_non_poke_messages(self):
+        history = [
+            self._poke_msg(1001, self._now(), content="你好"),
+            self._poke_msg(1001, self._now(), content=""),
+            self._poke_msg(1001, self._now()),
+        ]
+        assert poke.count_recent_pokes(history, 1001) == 1
+
+    def test_ignores_pokes_outside_the_window(self):
+        old = "2020-01-01 00:00:00"
+        history = [self._poke_msg(1001, old), self._poke_msg(1001, self._now())]
+        assert poke.count_recent_pokes(history, 1001) == 1
+
+    def test_unparsable_timestamp_counts_conservatively(self):
+        history = [self._poke_msg(1001, "not-a-timestamp")]
+        assert poke.count_recent_pokes(history, 1001) == 1
+
+    def test_never_returns_zero(self):
+        assert poke.count_recent_pokes([], 1001) == 1
+
+    def test_capped_to_avoid_prompt_growth(self):
+        history = [self._poke_msg(1001, self._now()) for _ in range(50)]
+        assert poke.count_recent_pokes(history, 1001) == poke.POKE_REPEAT_COUNT_MAX
+
+    def test_repeated_pokes_change_the_prompt(self):
+        """第 1 次与第 5 次的 SYSTEM 必须不同——否则“升级”无从发生。"""
+        first = build_messages(
+            current_user=CurrentUser(user_id=1001, display_name="小明"),
+            relationship="stranger",
+            memories=[],
+            history=[],
+            question="",
+            runtime_state="RUNTIME",
+            conversation_mode="poke",
+            recent_poke_count=1,
+        )
+        fifth = build_messages(
+            current_user=CurrentUser(user_id=1001, display_name="小明"),
+            relationship="stranger",
+            memories=[],
+            history=[],
+            question="",
+            runtime_state="RUNTIME",
+            conversation_mode="poke",
+            recent_poke_count=5,
+        )
+        assert "recent_poke_count: 1" in first[0]["content"]
+        assert "recent_poke_count: 5" in fifth[0]["content"]
+        assert first[0]["content"] != fifth[0]["content"]
+
+
 # ==========================================================================
 # v0.6.1：PacketBackend 熔断 / 错误分类 / 集成 / Context 诚实性
 # ==========================================================================

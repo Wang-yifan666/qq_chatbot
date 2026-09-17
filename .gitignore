@@ -34,3 +34,29 @@ debug_commands.md
 # 只保留 schema 文档 / 自造 example（docs/）与 RAG 代码 / build 脚本
 data/persona_processed/
 data/persona_rag/
+
+# ===== 知识库资料与索引（自备文档：可能含版权 / 隐私内容，禁止提交） =====
+# 只保留构建脚本 scripts/build_knowledge_rag.py 与运行时 services/knowledge_rag.py
+data/knowledge/
+data/knowledge_index/
+
+# ===== 本地调试 / 一次性脚本 / 临时产物（禁止提交） =====
+# 会话工作目录（DSH 等工具产生的 scratch，内容随会话变化）
+.dsh_tmp/
+# 根目录下的一次性排查脚本（_tmp_dbscan.py / _tmp_dump1.py 之类）
+_tmp_*.py
+*.tmp
+# 测试运行缓存
+.pytest_cache/
+
+# ===== 人格评测运行输出（每跑一次 eval 就重新生成，含模型实时输出） =====
+# 生成命令见 README：python scripts/eval_persona_behavior.py --live --out tests/...
+tests/persona_eval_live_output*.md
+
+# ===== 重构报告 / 前后对照（含真实群聊摘录与群友 QQ 号，禁止提交） =====
+# 里面引用了真实聊天记录（昵称、QQ 号、原话），与 persona.txt / debug_commands.md
+# 同级别的隐私数据。若要进仓库，请先把引用改写成脱敏示例。
+夜子_v0.7_v0.8_前后对照.md
+夜子第二阶段重构报告.md
+# 生成上面两份对照的专用脚本：内置了同一批真实聊天摘录（按需脱敏后可移出本规则）
+scripts/compare_before_after.py

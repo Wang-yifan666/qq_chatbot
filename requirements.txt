@@ -39,3 +39,15 @@ tzdata>=2024.1
 # 约 100MB；网络受限可设 HF_ENDPOINT=https://hf-mirror.com）。
 numpy>=1.26,<3
 sentence-transformers>=2.6,<4
+
+# ===== Message understanding layer: file reading (v0.7) =====
+# All parsers are read-only and ship as pure-Python or self-contained wheels.
+# Deliberately NO python-magic / libmagic: it needs an extra native DLL on
+# Windows, so file type detection is done in-process (extension + magic bytes
+# + OOXML zip structure) by services/perception/file_types.py.
+httpx>=0.27.0          # bounded streaming download (files / image conversion)
+PyMuPDF>=1.24.0        # PDF text layer extraction (no OCR)
+python-docx>=1.1.0     # DOCX paragraphs + table cells
+openpyxl>=3.1.0        # XLSX cells (read_only=True, formulas never evaluated)
+python-pptx>=0.6.23    # PPTX text per slide
+

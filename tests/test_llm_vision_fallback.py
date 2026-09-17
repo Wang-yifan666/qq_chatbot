@@ -23,9 +23,29 @@ class TestVisionCapability:
 
     def test_unknown_models_are_text_only(self):
         assert llm.provider_supports_vision("deepseek", "deepseek-chat") is False
-        assert llm.provider_supports_vision("deepseek", "deepseek-v4-flash") is False
         assert llm.provider_supports_vision("zhipu", None) is False
         assert llm.provider_supports_vision("zhipu", "glm-4.7-flash") is False
+        assert llm.provider_supports_vision("deepseek", "some-future-model") is False
+
+    def test_legacy_vision_aliases_normalize_to_flash(self):
+        """v0.7 行为变更（不再是 text-only）：
+
+        `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` 是同一个支持
+        text + image 的 DeepSeek Flash 模型的历史 alias。v0.5 时代它们不在
+        capability 表里，会被当成 text-only，从而出现“API 实际已经在用多模态
+        模型，本地却把图片过滤掉”的隐蔽 bug。v0.7 起 alias 统一归一化到
+        canonical 名 `deepseek-flash`，因此这里必须返回 True。
+        """
+        from services.model_registry import normalize_model_name
+
+        assert normalize_model_name("deepseek-v4-flash") == "deepseek-flash"
+        assert normalize_model_name("deepseek-v4-flash-vision-exp") == "deepseek-flash"
+        assert normalize_model_name("DEEPSEEK-FLASH") == "deepseek-flash"
+        assert llm.provider_supports_vision("deepseek", "deepseek-v4-flash") is True
+        assert (
+            llm.provider_supports_vision("deepseek", "deepseek-v4-flash-vision-exp")
+            is True
+        )
 
     def test_effective_model(self, monkeypatch):
         monkeypatch.setattr(llm, "DEEPSEEK_DEFAULT_MODEL", "deepseek-flash")

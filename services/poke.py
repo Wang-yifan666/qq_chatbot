@@ -37,17 +37,23 @@ v0.6.1 能力模型（把「收到戳」与「主动戳回」正式拆开）：
 import asyncio
 import os
 import time
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 
 from nonebot import logger
 
 from services import redact_secrets
+from services.affection_store import affection_level
 from services.affection_store import collect_participant_ids
+from services.affection_store import get_affection
 from services.affection_store import get_relationship_context
 from services.context_store import CONTEXT_MESSAGE_LIMIT
 from services.context_store import add_message
 from services.context_store import get_recent_messages
 from services.group_conversation import cancel_pending_ambient
 from services.group_conversation import get_group_conversation_state
+from services.interaction_profile import build_interaction_profile
 from services.llm_client import ask_with_fallback
 from services.persona_rag import PERSONA_RAG_ENABLED
 from services.persona_rag import retrieve as persona_rag_retrieve
@@ -58,6 +64,7 @@ from services.proactive_sender import send_group_message
 from services.prompt_builder import CurrentUser
 from services.prompt_builder import build_messages
 from services.relationship_service import get_effective_relationship
+from services.trigger_intensity import assess_trigger
 from services.user_store import get_user
 from services.user_store import upsert_user
 
@@ -217,6 +224,50 @@ POKE_BACK_CONTEXT_PLACEHOLDER = "[互动动作：机器人戳回了该用户]"
 POKE_QUERY_TEXT = "被群里认识的人戳了一下（拍一拍），夜子怎么自然反应"
 
 
+# ===== 连续 poke 感知（v0.8）=====
+# 目标：让“第一次戳”和“今天已经戳了第五次”产生不同的反应，
+# 而不是每轮从零开始重演同一句台词。
+#
+# 事实来源刻意选择**已有的 Context 表**，而不是新增计数器：
+# 每次 poke 都会写入 POKE_EVENT_CONTEXT_PLACEHOLDER（role=user），
+# 因此“最近窗口内这个人戳了几次”可以直接从历史里数出来——
+# 它是程序生成的事实、无需新增状态、重启后依然正确、也天然可测。
+POKE_REPEAT_WINDOW_MINUTES = 30
+POKE_REPEAT_COUNT_MAX = 9
+
+
+def count_recent_pokes(
+    history: list,
+    user_id: int,
+    *,
+    window_minutes: int = POKE_REPEAT_WINDOW_MINUTES,
+) -> int:
+    """统计最近窗口内该用户戳过机器人的次数（含本次已经入库的那条）。
+
+    - 只数 role=user 且 content 正好是 poke 占位符的消息（其它消息一概不算）；
+    - 时间解析失败 / 时区缺失时按“计入”处理（宁可多算一次，也不假装没发生）；
+    - 返回值至少为 1（本次 poke 本身）。
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(0, window_minutes))
+    count = 0
+    for message in history or []:
+        if getattr(message, "role", None) != "user":
+            continue
+        if getattr(message, "user_id", None) != user_id:
+            continue
+        if (getattr(message, "content", "") or "").strip() != POKE_EVENT_CONTEXT_PLACEHOLDER:
+            continue
+        created = (getattr(message, "created_at", "") or "").strip()
+        try:
+            stamp = datetime.strptime(created, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            count += 1
+            continue
+        if stamp >= cutoff:
+            count += 1
+    return max(1, min(POKE_REPEAT_COUNT_MAX, count))
+
+
 def clean_poke_reply(text: str | None, max_chars: int | None = None) -> str:
     """把 LLM 输出收敛为一条短文本；空 / 纯空白 → ''（当作没有文字回复）。
 
@@ -318,6 +369,31 @@ async def on_group_poke(group_id: int, user_id: int) -> str:
                 type(exc).__name__,
                 redact_secrets(str(exc)),
             )
+        affection = "normal"
+        try:
+            affection = affection_level(await get_affection(group_id, user_id))
+        except Exception as exc:
+            logger.error(
+                "[POKE] 读取亲近倾向失败（按 normal 处理）group_id={} user_id={}: {}: {}",
+                group_id,
+                user_id,
+                type(exc).__name__,
+                redact_secrets(str(exc)),
+            )
+        # 7.5 Interaction Profile（v0.8）：让“谁在戳”与“第几次戳”都影响反应。
+        #     recent_poke_count 从刚写入的 Context 里数出来（含本次），因此
+        #     “第一次”“又一次”“今天第 N 次”是有事实依据的，而不是随机台词。
+        interaction_profile = build_interaction_profile(relationship, affection)
+        recent_poke_count = count_recent_pokes(history, user_id)
+        # 强度：连续戳是"反复打扰"，次数直接决定强度（第 1 次 none / 第 3 次 medium /
+        # 第 5 次起 strong），并受关系上限夹取——陌生人可以烦，但只有熟悉/
+        # 例外关系才有资格让她真的发火。
+        trigger = assess_trigger(
+            "",
+            interaction_profile,
+            recent_poke_count=recent_poke_count,
+            mode="poke",
+        )
         relationship_context = ""
         try:
             participant_ids = collect_participant_ids(history, user_id)
@@ -369,6 +445,9 @@ async def on_group_poke(group_id: int, user_id: int) -> str:
             persona_refs=persona_refs,
             conversation_mode="poke",
             poke_back=poke_back,
+            interaction_profile=interaction_profile,
+            recent_poke_count=recent_poke_count,
+            trigger=trigger,
         )
 
         # 11. LLM：主备 fallback（tools=None）。失败 → 没有文字，但戳回照常执行

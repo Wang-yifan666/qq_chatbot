@@ -21,6 +21,9 @@ from nonebot import logger
 from services.deepseek import DEFAULT_MODEL as DEEPSEEK_DEFAULT_MODEL
 from services.deepseek import ask_deepseek
 from services.deepseek import call_deepseek
+from services.model_registry import VISION_CAPABLE_MODELS
+from services.model_registry import is_vision_capable
+from services.model_registry import normalize_model_name
 from services.tool_orchestrator import WEB_SEARCH_TOOL_SCHEMA
 from services.tool_orchestrator import run_with_tools
 from services.web_search import WEB_SEARCH_ENABLED
@@ -55,26 +58,39 @@ AI_FALLBACK_MODEL = (os.getenv("AI_FALLBACK_MODEL", "") or "").strip() or None
 # DIRECT 模式可用的工具（由程序根据 WEB_SEARCH_ENABLED 决定，聊天内容不能修改）
 TOOLS = [WEB_SEARCH_TOOL_SCHEMA] if WEB_SEARCH_ENABLED else None
 
-# ===== 视觉能力表（v0.5） =====
-# 只有官方明确验证支持 image input 的模型才标记 True；其他 provider / model
-# 一律视为 text-only（不猜能力）。deepseek-chat / glm-* 默认 text-only。
-VISION_CAPABLE_MODELS = frozenset({"deepseek-flash"})
+# ===== 视觉能力表（v0.5 → v0.7） =====
+# 能力表与 alias 归一化统一在 services/model_registry.py（本项目唯一来源）：
+# 这里只 re-export，方便旧调用方与测试继续 `from services.llm_client import
+# VISION_CAPABLE_MODELS`。任何模块都不允许再自建一份集合。
+# 归一化之后，配置里写 deepseek-v4-flash / deepseek-v4-flash-vision-exp 这类
+# 历史 alias 也会被识别为 vision-capable，不会再出现“API 用着多模态模型、
+# 本地却把图片过滤掉”的情况。
 
 
 def effective_model(provider: str, model: str | None) -> str:
-    """返回候选实际使用的模型名（model 显式传入优先，否则服务商默认模型）。"""
+    """返回候选实际使用的 canonical 模型名（alias 已归一化）。
+
+    model 显式传入优先，否则用服务商默认模型；两者都经过 normalize_model_name()，
+    因此 `deepseek-v4-flash-vision-exp` 与 `deepseek-flash` 在这里完全等价。
+    """
     if model:
-        return model.strip().lower()
+        normalized = normalize_model_name(model)
+        if normalized:
+            return normalized
     if provider == "deepseek":
-        return DEEPSEEK_DEFAULT_MODEL.strip().lower()
-    return GLM_DEFAULT_MODEL.strip().lower()
+        return normalize_model_name(DEEPSEEK_DEFAULT_MODEL)
+    return normalize_model_name(GLM_DEFAULT_MODEL)
 
 
 def provider_supports_vision(provider: str, model: str | None) -> bool:
-    """该 (provider, model) 候选是否被官方验证支持 image input。"""
+    """该 (provider, model) 候选是否被验证支持 image input。
+
+    非 deepseek 服务商（GLM）当前一律 text-only；deepseek 侧按归一化后的
+    canonical 模型名查 capability 表。
+    """
     if provider != "deepseek":
         return False
-    return effective_model(provider, model) in VISION_CAPABLE_MODELS
+    return is_vision_capable(effective_model(provider, model))
 
 
 def _candidates(require_vision: bool) -> list[tuple[str, str | None]]:

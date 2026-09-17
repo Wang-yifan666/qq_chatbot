@@ -72,10 +72,21 @@ class FakeChat:
         self.sent.append(message)
 
 
-async def _call_handler(handler, event) -> None:
-    """直接调用插件 handler；吞掉与 NoneBot 运行环境一致的 FinishedException。"""
+async def _call_handler(handler, event, bot=None) -> None:
+    """直接调用插件 handler；吞掉与 NoneBot 运行环境一致的 FinishedException。
+
+    bot：v0.7 起 DIRECT handler 通过 NoneBot 依赖注入拿到 OneBot V11 Bot
+    （只用于 Reply / Forward 的 get_msg / get_forward_msg 只读查询）。
+    其它插件的 handler 只有 event 参数，因此这里按签名决定是否传 bot。
+    """
+    import inspect
+
+    params = inspect.signature(handler).parameters
     try:
-        await handler(event)
+        if len(params) >= 2:
+            await handler(event, bot)
+        else:
+            await handler(event)
     except FinishedException:
         pass
 
@@ -94,10 +105,17 @@ async def _count(table: str, where: str = "") -> int:
 
 
 async def _gate_scenario() -> None:
-    """完整门禁场景：未授权群零副作用 + 授权群正常流程（全部桩化）。"""
+    """完整门禁场景：未授权群零副作用 + 授权群正常流程（全部桩化）。
+
+    对 `ai._answer` / `ai.chat` / `dg.debug` 的替换都用 monkeypatch，
+    测试结束时自动还原：否则这些桩会泄漏到同一 session 里的其它测试文件
+    （pytest 按文件顺序共用进程），让后面的端到端测试“看不到真实 pipeline”。
+    """
     import nonebot
 
     nonebot.init()
+
+    import pytest
 
     import services.database as dbm
     from plugins import ai_chat as ai
@@ -107,22 +125,40 @@ async def _gate_scenario() -> None:
 
     await dbm.init_db()
 
-    # --- 替换 AI 调用与回复通道（绝不打真实 API） ---
-    calls = {"answer": 0}
+    # --- 替换 AI 调用与回复通道（绝不打真实 API；测试结束自动还原） ---
+    calls = {"answer": 0, "last_resolved": None, "last_conversation": None}
 
-    async def fake_answer(event, question: str, images=None, image_total: int = 0) -> str:
+    async def fake_answer(
+        event,
+        normalized_text: str,
+        conversation=None,
+        resolved=None,
+    ) -> str:
+        """v0.7 桩：AI 层现在接收归一化文本 + 感知层结果，而不是原始图片列表。
+
+        这里只做记录，不做任何解析——解析全部由 Message Resolver 在插件内完成，
+        因此这些断言同时验证了“插件层不再自己解析 image segment”。
+        """
         calls["answer"] += 1
-        calls["last_images"] = images
-        calls["last_image_total"] = image_total
-        calls["last_question"] = question
+        calls["last_question"] = normalized_text
+        calls["last_resolved"] = resolved
+        calls["last_conversation"] = conversation
         return "stub-answer"
 
-    ai._answer = fake_answer
     ai_chat = FakeChat()
-    ai.chat = ai_chat
     dg_chat = FakeChat()
-    dg.debug = dg_chat
+    mp = pytest.MonkeyPatch()
+    mp.setattr(ai, "_answer", fake_answer)
+    mp.setattr(ai, "chat", ai_chat)
+    mp.setattr(dg, "debug", dg_chat)
+    try:
+        await _gate_scenario_body(nonebot, ai, amb, cr, dg, ai_chat, dg_chat, calls)
+    finally:
+        mp.undo()
 
+
+async def _gate_scenario_body(nonebot, ai, amb, cr, dg, ai_chat, dg_chat, calls) -> None:
+    """门禁场景主体（patch 的安装 / 还原由 _gate_scenario 负责）。"""
     # ===== 未授权群（333）：零副作用 =====
     # @机器人 hello → 不读正文、不调 AI、不回复
     ev = FakeEvent(333, 1001, 999, "@bot hello")
@@ -156,7 +192,10 @@ async def _gate_scenario() -> None:
     await _call_handler(cr.handle, ev)
     assert await _count("messages", "group_id = 333") == 0
     assert await _count("users", "user_id = 1003") == 0
-    assert await _count("relationships") == 0
+    # 只断言“本测试涉及的用户”没有关系记录：relationships 是全进程共享表，
+    # 其它测试文件（如 test_direct_pipeline）会为自己独立的测试用户写入计数，
+    # 这里不能把别人的数据算成本次未授权群的副作用。
+    assert await _count("relationships", "user_id IN (1001, 1002, 1003)") == 0
     assert await _count("user_memories") == 0
 
     # \debug memory set 携带敏感 value → 完全沉默，且正文未被读取
@@ -229,7 +268,10 @@ async def _gate_scenario() -> None:
     # ===== 授权群（111 / 222）：正常流程（AI 层桩替代） =====
     ev = FakeEvent(111, 1001, 999, "@bot hello")
     await _call_handler(ai.handle, ev)
-    assert ev.plaintext_calls == 1
+    # v0.7：授权群读取正文三次——\ping 快速自检判定、Message Resolver 的
+    # “无 segment 时纯文本兜底”、正常消息日志。真正的不变量是
+    # “白名单通过之后才读正文”：未授权群的 plaintext_calls 仍然是 0。
+    assert ev.plaintext_calls == 3
     assert calls["answer"] == 1
     assert ai_chat.finished == ["stub-answer"]
 
@@ -279,15 +321,17 @@ async def _gate_scenario() -> None:
     assert gstate.ambient_pending_task is None
     await asyncio.gather(pending_ambient, return_exceptions=True)
 
-    # ===== v0.5 DIRECT Vision（授权群；AI 层桩替代） =====
+    # ===== v0.5 → v0.7 DIRECT 多模态（授权群；AI 层桩替代） =====
+    import services.vision as vision_module
     from services.vision import VISION_ENABLED as _VI
 
     assert _VI is True  # conftest 默认开启
     # 纯文本 @ 行为与 v0.4 完全一致：不出现任何图片输入
     ev = FakeEvent(111, 1001, 999, "@bot hello")
     await _call_handler(ai.handle, ev)
-    assert calls["last_images"] == []
     assert calls["last_question"] == "hello"
+    assert calls["last_resolved"].image_accepted == 0
+    assert calls["last_conversation"].has_any_image is False
 
     # @夜子 + 1 张图片 + 文字 → 进入 pipeline，图片随问题一起交给模型层
     ev = FakeEvent(
@@ -299,9 +343,9 @@ async def _gate_scenario() -> None:
     )
     await _call_handler(ai.handle, ev)
     assert calls["last_question"] == "你觉得这个怎么样"
-    assert len(calls["last_images"]) == 1
-    assert calls["last_images"][0].url == "http://x/1.jpg"
-    assert calls["last_image_total"] == 1
+    assert calls["last_resolved"].image_total == 1
+    assert calls["last_resolved"].image_accepted == 1
+    assert calls["last_conversation"].has_any_image is True
 
     # @夜子 + 纯图片 → 不能回复旧的「有什么想问我的？」，必须进入 LLM pipeline
     ev = FakeEvent(
@@ -314,8 +358,8 @@ async def _gate_scenario() -> None:
     await _call_handler(ai.handle, ev)
     assert ai_chat.finished[-1] == "stub-answer", "纯图片应进入 AI pipeline 而不是提示语"
     assert calls["last_question"] == ""
-    assert len(calls["last_images"]) == 1
-    assert calls["last_image_total"] == 1
+    assert calls["last_resolved"].image_total == 1
+    assert calls["last_resolved"].image_accepted == 1
 
     # 多图：顺序保持、不超过 VISION_MAX_IMAGES（默认 4）
     ev = FakeEvent(
@@ -329,9 +373,15 @@ async def _gate_scenario() -> None:
         ],
     )
     await _call_handler(ai.handle, ev)
-    assert calls["last_image_total"] == 6
-    assert len(calls["last_images"]) == 4
-    assert [img.url for img in calls["last_images"]] == [
+    assert calls["last_resolved"].image_total == 6
+    assert calls["last_resolved"].image_accepted == 4
+    # 顺序保持：归一化 items 里的图片顺序与消息内顺序一致（绝不被重排）
+    accepted_urls = [
+        item.image.url
+        for item in calls["last_resolved"].message.items
+        if getattr(item, "type", "") == "image" and item.image is not None
+    ]
+    assert accepted_urls == [
         "http://x/m0.jpg",
         "http://x/m1.jpg",
         "http://x/m2.jpg",
@@ -347,12 +397,16 @@ async def _gate_scenario() -> None:
         segments=[SimpleNamespace(type="image", data={"file": "broken.img"})],
     )
     await _call_handler(ai.handle, ev)
-    assert calls["last_images"] == []
-    assert calls["last_image_total"] == 1
+    assert calls["last_resolved"].image_total == 1
+    assert calls["last_resolved"].image_accepted == 0
+    assert calls["last_conversation"].has_any_image is False
 
     # VISION_ENABLED=false + 纯图片 → 稳定降级回复，且不进入 LLM pipeline
+    # v0.7：Message Resolver 在实例化时读取 vision 模块的开关，
+    # 因此这里显式改 vision.VISION_ENABLED（与生产代码修改的是同一处配置）。
     before = calls["answer"]
     ai.VISION_ENABLED = False
+    vision_module.VISION_ENABLED = False
     ev = FakeEvent(
         111,
         1001,
@@ -364,9 +418,11 @@ async def _gate_scenario() -> None:
     assert ai_chat.finished[-1] == "我现在看不到图片。"
     assert calls["answer"] == before, "视觉关闭的纯图片请求不得调用模型"
     ai.VISION_ENABLED = True
+    vision_module.VISION_ENABLED = True
 
     # VISION_ENABLED=false + 图片 + 文字 → 纯文本正常回答（行为稳定降级）
     ai.VISION_ENABLED = False
+    vision_module.VISION_ENABLED = False
     ev = FakeEvent(
         111,
         1001,
@@ -376,17 +432,20 @@ async def _gate_scenario() -> None:
     )
     await _call_handler(ai.handle, ev)
     assert calls["last_question"] == "上面这句话什么意思"
-    assert calls["last_images"] == []
+    assert calls["last_resolved"].image_accepted == 0
     assert ai_chat.finished[-1] == "stub-answer"
     ai.VISION_ENABLED = True
+    vision_module.VISION_ENABLED = True
 
     # 白名单群普通消息 → 正常写入 messages + users（context_recorder 永不写关系/记忆）
     ev = FakeEvent(111, 1003, 999, "hello from allowed group")
     await _call_handler(cr.handle, ev)
     assert await _count("messages", "group_id = 111 AND content = 'hello from allowed group'") == 1
     assert await _count("users", "user_id = 1003") == 1
-    assert await _count("relationships") == 0
-    assert await _count("user_memories") == 0
+    assert await _count("relationships", "user_id IN (1001, 1002, 1003)") == 0
+    assert await _count(
+        "user_memories", "user_id IN (1001, 1002, 1003)"
+    ) == 0
 
     # 数据库连接不在这里关闭：tests/conftest.py 的 session 级 autouse fixture
     # 会在同一事件循环上统一关闭（在这里 close_db 会永久锁死后续测试的懒恢复）。
