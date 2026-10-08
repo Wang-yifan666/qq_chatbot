@@ -920,6 +920,134 @@ class TestAdapterStripsReplySegment:
 
 
 # ======================================================================
+# 回归（v0.9.1）：@别人 不能说丢就丢
+# ======================================================================
+
+# 线上实测（2026-09-17）：用户在群里 @ 了某位群友并说「这个叫做 @某人 的人欺负我」，
+# 但解析器把所有 at 段一律 continue 掉，模型只看到「这个叫做 的人欺负我」，
+# 只能回答「名字呢。空着的。你让我去找谁」。
+# 结论：@机器人 可以丢（触发信息已由 conversation_mode 表达），
+# **@别人 必须渲染出来** —— 它承载「说的是谁」这一关键信息。
+
+BOT_SELF_ID = 999  # 与 tests 里的 event() 默认 self_id 一致
+OTHER_QQ = "2001"
+
+
+class TestMentions:
+    async def test_at_bot_is_still_dropped(self):
+        """@机器人 不重复进正文（触发语义已由 conversation_mode 表达）。"""
+        resolver = MessageResolver(name_resolver=_name_resolver({"999": "夜子"}))
+        resolved = await resolver.resolve_event(
+            event(
+                [seg("at", qq=str(BOT_SELF_ID)), seg("text", text=" 你好")],
+                text=" 你好",
+            )
+        )
+        text = resolved.message.text()
+        assert "夜子" not in text
+        assert "@" not in text
+        assert text.strip() == "你好"
+
+    async def test_at_other_is_rendered_with_nickname(self):
+        resolver = MessageResolver(name_resolver=_name_resolver({OTHER_QQ: "小明"}))
+        resolved = await resolver.resolve_event(
+            event(
+                [
+                    seg("at", qq=str(BOT_SELF_ID)),
+                    seg("text", text=" 这个叫做"),
+                    seg("at", qq=OTHER_QQ),
+                    seg("text", text=" 的人欺负我"),
+                ],
+                text=" 这个叫做 的人欺负我",
+            )
+        )
+        text = resolved.message.text()
+        assert "@小明" in text
+        assert "欺负我" in text
+
+    async def test_mention_keeps_original_position(self):
+        """@ 的位置必须保持（「这个叫做 @小明 的人」不能变成「@小明 这个叫做的人」）。"""
+        resolver = MessageResolver(name_resolver=_name_resolver({OTHER_QQ: "小明"}))
+        resolved = await resolver.resolve_event(
+            event(
+                [
+                    seg("text", text="这个叫做"),
+                    seg("at", qq=OTHER_QQ),
+                    seg("text", text="的人欺负我"),
+                ],
+                text="这个叫做 的人欺负我",
+            )
+        )
+        text = resolved.message.text()
+        assert text.index("这个叫做") < text.index("@小明") < text.index("的人欺负我")
+
+    async def test_without_name_resolver_falls_back_to_qq(self):
+        """拿不到昵称也不能丢 —— 退化成 @QQ号。"""
+        resolver = MessageResolver()
+        resolved = await resolver.resolve_event(
+            event([seg("at", qq=OTHER_QQ), seg("text", text=" 欺负我")], text=" 欺负我")
+        )
+        assert f"@{OTHER_QQ}" in resolved.message.text()
+
+    async def test_name_resolver_exception_falls_back_to_qq(self):
+        async def boom(_qq):
+            raise RuntimeError("数据库炸了")
+
+        resolver = MessageResolver(name_resolver=boom)
+        resolved = await resolver.resolve_event(
+            event([seg("at", qq=OTHER_QQ), seg("text", text=" 欺负我")], text=" 欺负我")
+        )
+        assert f"@{OTHER_QQ}" in resolved.message.text()
+
+    async def test_name_resolver_returning_none_falls_back_to_qq(self):
+        resolver = MessageResolver(name_resolver=_name_resolver({}))
+        resolved = await resolver.resolve_event(
+            event([seg("at", qq=OTHER_QQ), seg("text", text=" 欺负我")], text=" 欺负我")
+        )
+        assert f"@{OTHER_QQ}" in resolved.message.text()
+
+    async def test_malformed_at_segment_is_ignored(self):
+        """没有 qq 的畸形 at 段只丢弃自己，不影响整条消息。"""
+        resolver = MessageResolver(name_resolver=_name_resolver({}))
+        resolved = await resolver.resolve_event(
+            event([seg("at"), seg("text", text="你好")], text="你好")
+        )
+        assert resolved.message.text().strip() == "你好"
+
+    async def test_mention_inside_forward_node_is_rendered(self):
+        """合并转发节点里的 @ 同样要渲染。"""
+        bot = FakeBot(
+            {
+                "get_forward_msg": {
+                    "messages": [
+                        node(
+                            "1",
+                            "甲",
+                            [api_seg("at", qq=OTHER_QQ), api_seg("text", text=" 你看看")],
+                        )
+                    ]
+                }
+            }
+        )
+        resolver = MessageResolver(bot, name_resolver=_name_resolver({OTHER_QQ: "小明"}))
+        resolved = await resolver.resolve_event(event([seg("forward", id="fwd-1")]))
+        forward = resolved.message.items[0]
+        joined = "".join(
+            getattr(item, "text", "") for n in forward.nodes for item in n.items
+        )
+        assert "@小明" in joined
+
+
+def _name_resolver(mapping: dict):
+    """构造一个 QQ → 昵称 的假查询函数。"""
+
+    async def resolve(qq: str):
+        return mapping.get(str(qq))
+
+    return resolve
+
+
+# ======================================================================
 # 回归（v0.7.2）：群文件段没有 url，必须用 get_group_file_url 换下载直链
 # ======================================================================
 

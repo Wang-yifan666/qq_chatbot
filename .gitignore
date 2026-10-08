@@ -23,6 +23,8 @@ __pycache__/
 # ===== 运行时数据（SQLite 群聊历史 / 个人资料库，禁止提交真实数据） =====
 data/*.db*
 !data/.gitkeep
+# 看门狗的状态文件（运行时生成，记录上次告警时间/尝试次数）
+data/watchdog_state.json
 
 # ===== 本地人格覆盖文件（可选，禁止提交本机自定义人格） =====
 persona.txt
@@ -39,6 +41,7 @@ data/persona_rag/
 # 只保留构建脚本 scripts/build_knowledge_rag.py 与运行时 services/knowledge_rag.py
 data/knowledge/
 data/knowledge_index/
+data/paint/
 
 # ===== 本地调试 / 一次性脚本 / 临时产物（禁止提交） =====
 # 会话工作目录（DSH 等工具产生的 scratch，内容随会话变化）

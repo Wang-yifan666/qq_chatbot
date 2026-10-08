@@ -71,6 +71,10 @@ QQ 服务器 / NapCat（OneBot 11 协议）                     morning_greeting
 │     管理员调试命令：whoami / status / memory set|list|del|clear / rag
 │     维护 data/qq_ai_bot.db 中的个人资料（Personal Memory）
 │
+├─ plugins/paint.py（priority=1, block=True，/paint 开头即触发，无需 @，v0.10）
+│     管理员生图命令：/paint 描述 → 冷却/每日上限 → 生图 API → 落盘留档 → 发图 + 夜子一句话
+│     仅 PAINT_ADMIN_QQ（默认沿用 DEBUG_ADMIN_QQ）可用；未配置 Key 时整条命令不生效
+│
 ├─ plugins/context_recorder.py（priority=20）
 │     白名单群纯文本消息 → context_store 写入 SQLite（data/chat_history.db）
 │     同时 upsert 用户身份（users 表）；只记录，不回复，不调用 AI
@@ -916,6 +920,7 @@ qq_ai_bot/
 │   ├── test_trigger_intensity.py    # v0.9 事件强度：分级 / 上限 / 与画像正交 / Prompt 注入
 │   ├── test_knowledge_rag.py        # v0.9 知识库：分块 / 索引校验 / 阈值过滤 / 接线 / 全降级路径
 │   ├── test_persona_eval_assets.py  # 人格 eval 资产自检（用例集与评分口径）
+│   ├── test_paint.py                # v0.10 生图：命令解析 / 权限 / 冷却限额 / 存档 / 双返回形态
 │   └── persona_cases.json           # 人格 eval 用例集（可提交，自造用例）
 │
 ├── scripts/
@@ -924,6 +929,7 @@ qq_ai_bot/
 │   ├── build_knowledge_rag.py# 资料文档 → 知识库索引（v0.9，复用感知层解析器）
 │   ├── test_knowledge_rag.py # 知识库检索质量 / 阈值标定（--min-score 0.0 看全部分数）
 │   ├── eval_persona_behavior.py # 人格行为 eval（--live 调真实模型，输出对比报告）
+│   ├── pi_watchdog.py        # 树莓派独立看门狗：不依赖 Bot 进程，离线就发邮件 + 附掉线日志（v0.9.1）
 │   ├── scan_privacy.py       # 推送前隐私守门人：查待提交文件里的真实 QQ/群号/昵称
 │   ├── check_readme_consistency.py # 文档守门人：README 目录树 ↔ 真实文件系统一致性
 │   └── test_group_access.py  # 群聊白名单验证（纯解析 + 启动语义 + 插件门禁，无测试框架）
@@ -978,6 +984,7 @@ qq_ai_bot/
     ├── embedding_backend.py  # 可替换 EmbeddingBackend + 进程级单例（模型只加载一次）（v0.3.0）
     ├── persona_rag.py        # Persona RAG：过滤/检索/rerank/diversity → PersonaReference（v0.3.0）
     ├── knowledge_rag.py      # 知识库 RAG：你的资料文档 → 检索 → UNTRUSTED 参考块（v0.9）
+    ├── image_gen.py          # 生图 API 纯 Transport：OpenAI 兼容网关 + b64/url 双形态（v0.10）
     ├── offline_alert.py      # 掉线邮件告警（stdlib smtplib，纯本地、无第三方依赖）（v0.1）
     ├── prompt_builder.py      # 唯一 Persona Core 来源 + 安全规则 + conversation_mode 构造（v0.4→v0.7）
     ├── deepseek.py            # DeepSeek 纯 LLM Transport + ask_deepseek(messages)（默认 deepseek-flash）
@@ -1570,6 +1577,244 @@ python scripts/test_knowledge_rag.py "无关的问题" --min-score 0.0
 不做 rerank（纯 cosine + 阈值）、不做增量更新（改资料要重建索引）、
 不做多轮检索（只用当前这一句提问）、扫描件 PDF 读不到（走文字层，不做 OCR）。
 完整说明与调参建议见 **`docs/knowledge_rag.md`**。
+
+## 掉线告警（v0.1）与独立看门狗（v0.9.1）
+
+两套告警**刻意并存**，因为它们的失效模式不重叠：
+
+| | `services/offline_alert.py` | `scripts/pi_watchdog.py` |
+| --- | --- | --- |
+| 触发者 | Bot 进程内的 OneBot 断连事件 | 树莓派上的 systemd timer（每 2 分钟） |
+| 覆盖场景 | 正常掉线 | Bot 没起来 / 卡死 / 从未连接 / **树莓派断网** |
+| 依赖 | Bot 进程活着 | 只依赖 Python 标准库，**不 import 项目任何模块** |
+
+一句结论：**"保证能通知到你"不能建立在被监控对象自己的代码上。**
+两次真实事故就是这么来的 ——
+
+- 2026-09-21：NapCat 登录失效，Bot 进程起来了但从未连接 → **没有断连事件** → 告警根本没被激活，
+  看门狗（当时还没有）之外无人发现；
+- 2026-09-25：告警触发、发出、**发送失败** → 当时没有重试 → 静默 2 天 7 小时；
+- 2026-09-28：树莓派 WiFi 17:46 掉线 3 小时 47 分，QQ 因此失联。
+  只查 NapCat 会报成"QQ 未登录 → 去扫码"，把人引向完全错误的方向。
+
+### 判据（四条全满足才算在线）
+
+1. `qq-bot.service` active；
+2. 树莓派本身能访问外网（对固定 IP 做 TCP 探测，**不用域名** —— 断网时 DNS 通常一起挂）；
+3. NapCat WebUI `CheckLoginStatus` 返回 `isLogin: true`；
+4. 本地 8080 端口存在 **ESTAB** 连接（OneBot 反向 WebSocket 链路在）。
+
+任一条不满足 → 离线，并给出 `reason`，决定要不要重启、邮件里怎么写：
+
+| reason | 重启？ | 为什么 |
+| --- | --- | --- |
+| `bot_service_down` | 重启 qq-bot | 进程没了，重启有效 |
+| `no_internet` | **不重启** | 断网时重启服务没有任何意义，只会白刷日志 |
+| `napcat_unreachable` | 重启 napcat | NapCat 卡死，重启有效 |
+| `onebot_link_missing` | 重启 qq-bot | QQ 已登录但链路断了，重建连接有效 |
+| `qq_not_logged_in` | **不重启** | 需要人工扫码；重启只会让二维码失效（09-21 空转了 639 次） |
+
+sudoers 只授权两条**精确的命令行**（`systemctl restart qq-bot` / `napcat`），
+不带任何额外参数。
+
+### 邮件策略（少而准，绝不刷屏）
+
+**一次掉线最多两封：离线 1 封 + 恢复 1 封**（都带日志附件）。
+
+- **纯文本正文**：不含任何 markdown 记号（`**粗体**`、`# 标题` 在纯文本邮件里
+  只会显示成字面星号 / 井号），分层用「」和短横线；
+- 每封告警都带 `.txt` 日志附件，正文里再放一小段摘要；
+- 离线达到阈值后发**一封**；只有"还没送达"才会重试（同一封，非发出去不可），
+  送达后不再重复；
+- 想要周期性提醒才把 `WATCHDOG_REALERT_SECONDS` 设成 >0（**默认 0 = 不重复**）。
+  默认 0 是 2026-09-29 的教训：30 分钟一封把邮箱刷爆，人只能关机躲它；
+- 恢复时发一封总结（带完整日志附件）。**如果离线期间那封根本没送出去**
+  （断网时邮件发不出去），恢复这封会明确写成"补报"并说明原因，绝不静默；
+- 恢复邮件自己发失败 → 保留状态，下一个 tick 继续重试；
+- 每次尝试都追加到 `data/watchdog.log`，独立于 journald（09-25 那次 journal
+  被另一个服务刷爆，连"到底发没发"都查不到）。
+
+> 「只发一封」不等于「发不出去就算了」：未送达的告警会一直重试到成功 ——
+> 09-25 静默 2.5 天的根因正是"只发一次、失败就没了"。
+
+### 附件里有什么
+
+`collect_logs()` 采集五段：看门狗日志、napcat 服务日志、qq-bot 服务日志、
+**网络事件**、Bot 侧告警投递记录（`data/offline_alert.log`）。
+
+网络事件段有两个实测踩出来的讲究：
+
+1. **按单元直查**（NetworkManager / wpa_supplicant / systemd-networkd / dhcpcd），
+   而不是"取全系统最后 N 行再过滤" —— 本机 journal 很吵（etest / qq-bot 刷屏），
+   17:46 的掉线事件当天就已经被挤出窗口；
+2. **同时采"故障发生前后"与"最近"两段** —— 09-28 离线 3 小时 47 分，
+   只取尾部的话抓到的全是 21:33 的"恢复"，看不到 17:46 的真正原因。
+   实测附件里能直接读到
+   `wlan0: CTRL-EVENT-DISCONNECTED` 与
+   `device (wlan0): state change: activated -> failed (reason 'ssid-not-found')`。
+
+附件是纯文本，有大小上限（96 KB，超出截断），**不含任何凭据**。
+
+### 运维
+
+```bash
+python3 scripts/pi_watchdog.py --dry-run      # 只打印判定，不改状态 / 不发信 / 不重启
+python3 scripts/pi_watchdog.py --test-email    # 只测发信链路
+python3 scripts/pi_watchdog.py --status        # 打印状态文件
+systemctl list-timers qq-watchdog.timer        # 看下一轮什么时候跑
+tail -n 40 data/watchdog.log                   # 历史判定与投递结果
+```
+
+## 生图命令 /paint（v0.10）
+
+管理员可以在群里让机器人画一张图，**两种用法**：
+
+```text
+/paint 一只戴着毛线帽的橘猫，坐在窗台上晒太阳         ← 文生图
+（引用一张图）/paint 把它改成抱着一个手机              ← 图生图（以被引用的图为参考）
+```
+
+参考图的取法：**本条消息里的图优先，其次是被引用消息里的图**；两种都没有就走文生图。
+只认 `url` 字段里的 http 链接（NapCat 在 `enableLocal2Url=false` 时只给本机文件名，
+拿它当地址会得到一个访问不了的地方）—— 有图但取不到地址时会**明确告诉用户**，
+而不是悄悄退化成文生图（那样画出来的人跟用户指的完全无关）。
+
+### 调用链
+
+```text
+群白名单（fail-closed，未授权群连命令正文都不读）
+  → 管理员校验（PAINT_ADMIN_QQ，默认沿用 DEBUG_ADMIN_QQ）
+  → 冷却（默认 60s/人）+ 每日上限（默认 20 张/天，全局）
+  → 回一句「夜子正在画…」
+  → **先判定有没有参考图**（只读消息段，不发网络请求）—— 有图 = 改图模式，改写规则完全不同
+  → **把用户要求交给模型整理成绘图模型能懂的话**（失败则退回原话）
+      · 文生图：夜子带人格按自己的审美写一段具体画面
+          「画一个你最喜欢的东西」→「一只蜷在旧书堆上打盹的橘猫，暖黄台灯光，厚涂插画风格」
+      · 改图：换中立的改写器，**只整理"要改什么"、禁止描述原图**，最后再套一层程序拼的锚点
+          「画一张上面这个人抱着手机的图片」→「…修改要求：在原图里给这个人手里加一部手机」
+  → 有参考图 → services/image_gen.py 走 /v1/images/edits（input_fidelity=high）
+    没有参考图 → 走 /v1/images/generations
+  → 落盘 data/paint/<时间>-<QQ>.png + <同名>.txt（含 mode / asked / image_prompt / 群 / 用户）
+     图生图时另外存一份 <同名>-ref.<原后缀> 作为参考图留档
+  → 发图（OneBot image 段）+ 夜子的一句话（复用 STATIC_SYSTEM_PROMPT，失败有兜底）
+     改写后的画面只进存档和群聊上下文，不附在消息里
+  → 写一条 [<机器人名>画了一张图：…] 进群聊上下文（见下一节）
+```
+
+### 接哪家 API
+
+走标准的 **OpenAI Images API**（`POST /v1/images/generations`），默认指向换API 的
+`gpt-image-2`，调用方式见 <https://www.huanapi.com/articles/9>。任何 OpenAI 兼容
+网关都能用 —— 只改 `PAINT_BASE_URL` / `PAINT_MODEL` 即可。
+
+> 换API 要求 API Key 的**令牌分组为 GTP**，否则会 401/403。
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PAINT_ENABLED` | `true` | 关掉后命令完全不可用 |
+| `PAINT_API_KEY` | 空 | **空 = 命令惰性**，Bot 照常启动，只是 `/paint` 会提示未配置 |
+| `PAINT_BASE_URL` | `https://www.huanapi.com/v1` | 只写到 `/v1`，SDK 自己拼 `/images/generations` |
+| `PAINT_MODEL` | `gpt-image-2` | 模型名 |
+| `PAINT_SIZE` | `1024x1024` | 见下「尺寸规则」，非法值本地拒绝并回落 |
+| `PAINT_QUALITY` | `auto` | `low` / `medium` / `high` / `auto` |
+| `PAINT_OUTPUT_FORMAT` | `png` | `png` / `jpeg`（provider 不建议 webp） |
+| `PAINT_RESPONSE_FORMAT` | `b64_json` | `b64_json` / `url` |
+| `PAINT_MODERATION` | 空 | `auto` / `low`；留空则**不发送该字段** |
+| `PAINT_INPUT_FIDELITY` | `high` | 图生图保留原主体的程度；**留空则不发该字段** |
+| `PAINT_REWRITE_PROMPT` | `true` | 是否先让模型把要求整理成画面/指令再交给画图模型（文生图用带人格的规则，改图用中立规则） |
+| `PAINT_REWRITE_MAX_CHARS` | `120` | 改写结果的长度上限（超出截断，防止模型写小作文） |
+| `PAINT_ADMIN_QQ` | 空 | 留空则沿用 `DEBUG_ADMIN_QQ` |
+| `PAINT_COOLDOWN_SECONDS` | `60` | 每人冷却 |
+| `PAINT_DAILY_LIMIT` | `20` | 每日总张数上限（进程内计数，重启清零） |
+| `PAINT_DIR` | `data/paint` | 存档目录（已 gitignore） |
+
+### 尺寸规则（provider 硬性要求，本地先校验）
+
+- 要么 `auto`，要么 `<宽>x<高>`；
+- 宽高都必须是 **16 的倍数**，最大边长 **≤ 3840**；
+- 长边 / 短边 **≤ 3**；
+- 总像素数在 **655,360 ~ 8,294,400** 之间。
+
+合法示例：`1024x1024` / `1536x1024` / `1024x1536` / `2048x2048` / `3840x2160` / `auto`。
+不合法时**本地就拒绝**并回落到 `1024x1024`（不会白花一次请求）。
+
+### 让「聊天的自己」知道「画画的自己」
+
+画画和聊天是**两个不同的模型**：出图走换API（gpt-image-2.5-sunburst），
+聊天走 DeepSeek（deepseek-flash）。两者互不知情，早期实测出现过这个尴尬场面：
+
+```text
+夜子：（发了一张刚画好的图）
+群友：你这画的是书吗
+夜子：再说，这也不是我画的——你从哪翻出来的。     ← 自己不认自己画的图
+```
+
+原因是两条：**人格提示里没写「你会画画」**，而且 **/paint 的出图结果没有进群聊上下文** ——
+对聊天模型来说，那张图确实来路不明。现在两处都补上了：
+
+- prompt_builder 的 【capabilities】 块里多一行 paint: true/false（由 /paint
+  的真实配置推断），并说明「最近群聊里出现 [夜子画了一张图：…] 就是你刚画的，
+  被问到要如实承认，不要否认」；
+- /paint 成功后会调用 context_store.add_message(role="assistant") 写入一条
+  [夜子画了一张图：<prompt>]（图生图则是 （在原图基础上修改）），
+  格式由 paint_context_text() 统一生成，能力声明与写入方共用，永远不会对不上。
+
+### 改写为什么分两套规则（v0.10.2 的真实事故）
+
+v0.10.1 加改写时只有一套规则 —— 让夜子按自己的审美写一整段画面描述。
+这对文生图是对的，对**改图是灾难**。实测：
+
+```text
+用户： （发出自己的照片）+ /paint 画一张上面这个人抱着一个手机的图片
+改写： 一个安静的黑发少女独自坐在堆满旧书的窗边，怀里抱着亮着屏幕的手机…
+出图： 一个动漫少女坐在图书馆里                         ← 照片里的人被整个换成了夜子自己
+```
+
+原因有两层，缺一不可：
+
+1. **改写模型看不见那张图**，「上面这个人」对它毫无意义，它只能凭想象编一个主体；
+2. **改写请求带着夜子的人格**，而夜子自己就是个少女 —— 于是她把自己画了进去。
+
+而绘图模型那边其实是好的：同一句提示词「把这个人穿的黑色T恤换成亮红色，
+长相/脸/眼镜/姿势/背景完全不变」，带原图走 `/v1/images/edits` 得到的是**本人换了件红衣服**，
+不带图走 `/v1/images/generations` 则是一个凭空捏造的陌生人。参考图一直传得好好的，
+是改写把主体覆盖掉了。
+
+现在的规则：
+
+- **有参考图 → 换一套完全不同的改写**：中立的 system（不带人格）、
+  明令「不要描述原图里有什么」、只输出一句修改指令；
+- 改写完再套一层**程序拼的锚点**（不经过模型，模型改不掉）：
+  `在原图基础上修改，保持原图里主体的长相与身份不变。修改要求：<指令>`；
+- 这个锚点**即使 `PAINT_REWRITE_PROMPT=false` 也会加上** —— 它是主体不被换掉的最后一道保险；
+- 判定「有没有参考图」被提到改写**之前**（只读消息段，不发网络请求），
+  否则改写时还不知道该用哪套规则。
+
+### 两个刻意的实现选择
+
+- **默认 `response_format=b64_json`**：文档说「想让程序自行保存图片」用这个。
+  本 Bot 一定会把图存到本地，用 b64 少一次下载、也不受临时链接过期影响。
+  服务端若仍然返回 `url`（或把配置改成 `url`），代码会自动下载 —— 两种形态都兼容。
+- **vendor 参数走 `extra_body`**：`output_format` / `moderation` 这类字段 OpenAI SDK
+  并未声明，当关键字直接传会 `TypeError`；统一放进 `extra_body` 才能原样进入 JSON body。
+  文档明确「不支持」的 `stream` / `partial_images` 与「不建议」的 `style` 一律不发。
+
+### 安全边界
+
+- 只处理群消息；群访问白名单失败即丢弃，**不读取命令正文**；
+- 只有管理员白名单里的 QQ 能用；命令消息 `block=True`，**不进群聊上下文记录**；
+- 冷却 + 每日上限双保险，避免刷爆额度；**失败的请求不占额度**；
+- 描述长度上限 500 字；日志只记「谁 / 多少字 / 结果」，prompt 截断后记录并过 `redact_secrets`；
+- 绝不输出 API Key / base64 / 带签名的 URL；任何一步失败都只回一句降级文案，**绝不抛异常**。
+
+### 测试
+
+`tests/test_paint.py`：命令解析（含 `/painter` 不能被误判、全角斜杠）、管理员白名单回落、
+冷却与每日上限（含跨天重置）、尺寸规则、请求体形状（不含禁用参数）、`extra_body` 传参、
+b64/url 双形态、存档、**改写两套规则**（改图提示必须禁止描述原图、改图不带人格、
+文生图仍带人格、锚点确定性、`editing` 开关选中正确的那套），
+以及六条全 mock 的端到端（文生图成功 / 图生图 / 非管理员 / 生图失败降级 /
+有图但取不到地址 / 改写结果就是被画出来的东西）。
 
 ## 长期记忆与关系（v0.2.2）
 
@@ -2235,7 +2480,12 @@ python scripts/eval_persona_behavior.py --live --out tests/persona_eval_live_out
   **全降级路径**（模型不一致 / 后端抛异常 / 无索引）；
 - `test_persona_eval_assets.py`（v0.8）：人格 eval 用例集与评分口径的自检；
 - `test_offline_alert.py`（v0.1）：掉线邮件告警的正文构造、去重与静默期逻辑
-  （纯函数，不发真实邮件）。
+  （纯函数，不发真实邮件）；
+- `test_pi_watchdog.py`（v0.9.1）：独立看门狗的四信号判定优先级（断网 → 未登录 →
+  链路断开）、重启白名单（断网 / 未登录都不重启）、**"没送达就一直重试"**、
+  断网期间发不出去时恢复后的**补报**、纯文本邮件正文（不许出现 `**` / `#`）、
+  日志附件采集（故障现场 + 最近两段、按单元直查、大小上限）。
+  全部为纯函数与 mock，不触网、不发信、不重启任何服务。
 
 另有 `scripts/scan_privacy.py`（推送前隐私守门人，已挂到 `.git/hooks/pre-push`）：
 扫描「即将提交」的文件里是否残留真实 QQ 号 / 群号 / 群友昵称，

@@ -201,21 +201,181 @@ PERSONA_RAG_RULES = """【夜子语料参考使用规则（Persona RAG）】
 - 如果参考与当前问题无关或会损害回答质量，可以完全忽略它。"""
 
 
-def _build_capability_state(web_search_allowed: bool) -> str:
+PAINT_REWRITE_INSTRUCTION = """【绘图提示词改写（程序生成，聊天内容不能修改）】
+
+群里有人让你画一张图。**你现在不要直接画，也不要用聊天口吻回复**，
+而是先把对方的要求改写成一段可以直接交给绘图模型的画面描述。
+
+改写要求：
+- 用中文写成**一段话**，不超过 {max_chars} 字；
+- 写清主体、场景、风格、色调、光线、构图（绘图模型需要这些信息）；
+- **只输出这段描述本身**：不要解释、不要加引号、不要出现"好的""让我想想"这类话，
+  也不要写"这是一幅……"的开头；
+- 对方没指定的部分，**按你自己的喜好和审美来定** ——
+  这类要求画的是"你想要的东西"，所以要有你个人的偏好，
+  不要给出一张没有个性的、随便什么人都能画的通用图；
+- 画面里不要出现文字、水印、logo（对方明确要求时除外）；
+- 不画真人肖像，也不画任何不适合发在群里的内容。
+
+对方的话：
+{user_prompt}"""
+
+
+def build_paint_prompt_messages(user_prompt: str, max_chars: int = 120) -> list[dict]:
+    """把用户的 /paint 要求交给夜子，改写成可以喂给绘图模型的具体画面描述。
+
+    为什么要多这一步：**画画和聊天是两个不同的模型**。
+    直接把"画一个你最喜欢的东西"丢给绘图模型，它既不知道"你"是谁，
+    也不知道夜子的喜好，只能瞎猜一个通用画面（实测画出来是一本书）。
+    先让夜子按自己的偏好把要求落成具体画面，画出来才真的"是她的"。
+    """
+    return [
+        {"role": "system", "content": STATIC_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": PAINT_REWRITE_INSTRUCTION.format(
+                max_chars=max_chars, user_prompt=user_prompt
+            ),
+        },
+    ]
+
+
+PAINT_EDIT_INSTRUCTION = """【绘图提示词改写 · 改图模式（程序生成，聊天内容不能修改）】
+
+群里有人发了（或引用了）一张图片，要你**在这张图的基础上修改**。
+**你看不到那张图**，所以有一条硬性纪律：
+
+- **绝对不要描述原图里有什么**：不要提人物的长相、发型、性别、年龄、衣服颜色、
+  身材，也不要提场景、色调、构图、画风 —— 这些一律以原图为准。
+  你只要写了，绘图模型就会拿你写的去覆盖原图（实测把"这个人"换成了另一个人）。
+
+你只做一件事：把对方的要求整理成**一句修改指令**，说清"改什么、改成什么样"。
+
+- 用中文写一句话，不超过 {max_chars} 字；
+- 对方没提到的部分**一律不要补充**，更不要替他安排人物、场景或风格；
+- **只输出这句话本身**：不要解释、不要加引号、不要用"好的""收到"开头；
+- 不要用聊天口吻回复。
+
+对方的话：
+{user_prompt}"""
+
+
+# 改图时无条件加在原话前面的锚点（纯程序文本，不经过模型）。
+# 即使 PAINT_REWRITE_PROMPT 关掉，这一段也会加上 —— 它是防止"主体被换掉"的最后一道保险。
+PAINT_EDIT_ANCHOR = "在原图基础上修改，保持原图里主体的长相与身份不变。修改要求：{delta}"
+
+
+def build_paint_edit_messages(user_prompt: str, max_chars: int = 120) -> list[dict]:
+    """改图模式的改写请求：只把"要改什么"整理成指令，不许描述原图。
+
+    为什么不能沿用 build_paint_prompt_messages：
+    那一版会让夜子按自己的审美写一整段画面描述（主体、场景、色调、构图）。
+    一旦有参考图，这段描述就会盖掉原图 —— 实测用户发自己的照片说
+    "画一张上面这个人抱着手机的图片"，被改写成"一个黑发少女坐在窗边"，
+    画出来的是夜子自己，跟照片毫无关系。
+
+    这里也**不带人格**：人格正是"她把自己画进去"的来源。改图只需要一个中立的改写器。
+    """
+    return [
+        {"role": "system", "content": "你是绘图提示词改写助手，只输出改写后的那一句话本身。"},
+        {
+            "role": "user",
+            "content": PAINT_EDIT_INSTRUCTION.format(
+                max_chars=max_chars, user_prompt=user_prompt
+            ),
+        },
+    ]
+
+
+def build_edit_prompt(delta: str, original: str = "") -> str:
+    """把改写（或原话）包成带锚点的改图指令（纯函数）。
+
+    delta 为空时退回 original；两者都为空时返回空串，由调用方处理。
+    """
+    body = (delta or "").strip() or (original or "").strip()
+    if not body:
+        return ""
+    return PAINT_EDIT_ANCHOR.format(delta=body)
+
+
+def clean_image_prompt(raw: str, max_chars: int = 120) -> str:
+    """把模型输出的画面描述清理成干净的一行（纯函数）。
+
+    - 去掉首尾空白与换行，把内部换行压成空格；
+    - 去掉常见的包裹形式：引号、书名号、「」、markdown 代码块；
+    - 去掉"好的，""这是一幅"之类的开场白；
+    - 按 max_chars 截断。清理后为空则返回空串（调用方退回原话）。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    # 代码块围栏与零散反引号都去掉（模型偶尔会把描述裹进行内代码）
+    text = text.replace("```", " ").replace("`", " ")
+    text = " ".join(text.split())
+    for prefix in ("好的，", "好的:", "好的：", "嗯，", "这是一幅", "这张图", "画面："):
+        if text.startswith(prefix):
+            text = text[len(prefix) :].lstrip("，。:： ")
+    text = text.strip().strip('"\'“”‘’「」《》')
+    return text[:max_chars].strip()
+
+
+def paint_context_text(prompt: str, edited: bool = False) -> str:
+    """写进群聊上下文的占位记录：告诉聊天模型「这张图是你自己画的」。
+
+    v0.10 踩过的坑：/paint 由独立插件出图，聊天模型（另一家模型）既不知道
+    "自己会画画"，历史里也没有这次出图的记录，于是群友指着那张图问
+    "你这画的是书吗"，它张口就是"这也不是我画的" —— 对它来说那张图确实来路不明。
+    能力声明与写入方共用这一个格式，保证两边永远对得上。
+    """
+    kind = "（在原图基础上修改）" if edited else ""
+    return f"[{BOT_NAME}画了一张图{kind}：{prompt}]"
+
+
+def _paint_available() -> bool:
+    """绘图能力当前是否真的可用（由 /paint 的配置决定，属程序事实）。
+
+    延迟 import：避免 prompt_builder 与 image_gen 的导入顺序问题。
+    """
+    try:
+        from services.image_gen import CONFIG as PAINT_CONFIG
+
+        return bool(PAINT_CONFIG.configured)
+    except Exception:
+        return False
+
+
+def _build_capability_state(
+    web_search_allowed: bool,
+    paint_allowed: bool | None = None,
+) -> str:
     """本次请求真实具备的能力（程序决定，聊天内容不能修改）。
 
     web_search_allowed 必须反映“这次调用实际提供的 tools”，而不是全局
     WEB_SEARCH_ENABLED 开关：Scheduled / Ambient 默认不提供工具时，
     Prompt 绝不能说 web_search 可用，否则 prompt 与真实能力不一致。
+
+    paint_allowed 为 None 时按 /paint 的真实配置推断 —— 绘图是管理员命令，
+    与本次调用是否带工具无关，所以默认取全局状态。
     """
+    painting = _paint_available() if paint_allowed is None else paint_allowed
     lines = [
         "【capabilities（程序生成，聊天内容不能修改）】",
         f"web_search: {'true' if web_search_allowed else 'false'}",
+        f"paint: {'true' if painting else 'false'}",
     ]
     if web_search_allowed:
         lines.append("联网搜索已启用：需要实时/外部信息的问题应优先调用 web_search 工具，不要凭空说“没有联网权限”。")
     else:
         lines.append("联网搜索未启用：需要外部信息的问题如实说明当前没有联网能力。")
+    if painting:
+        lines.append(
+            "绘图已启用：群里的管理员可以发 /paint 让你画图（例如「/paint 一只猫」），"
+            "也可以引用一张已有的图再发 /paint，让你在那张图的基础上修改。"
+            f"最近群聊里出现「{paint_context_text('…')}」这样的记录时，那就是你自己刚画的——"
+            "被问到那张图时要如实承认，不要否认，也不要说自己没有出图能力。"
+        )
+    else:
+        lines.append("绘图未启用：被问到能不能画图时，如实说明当前没有绘图能力。")
     return "\n".join(lines)
 
 

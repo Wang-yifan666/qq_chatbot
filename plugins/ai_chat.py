@@ -95,6 +95,7 @@ from services.reply_splitter import SPLIT_REPLY_ENABLED
 from services.reply_splitter import split_reply
 from services.runtime_context import TIMEZONE
 from services.runtime_context import get_now
+from services.user_store import get_user
 from services.user_store import upsert_user
 from services.vision import VISION_ALL_FAILED_REPLY
 from services.vision import VISION_DISABLED_REPLY
@@ -128,6 +129,21 @@ async def _rule_direct_mention(event: GroupMessageEvent) -> bool:
     if event.reply is not None and event.reply.sender.user_id == event.self_id:
         return True
     return False
+
+
+async def _resolve_mention_name(qq: str) -> str | None:
+    """QQ 号 → 最近昵称（供 Message Resolver 渲染「@某人」）。
+
+    感知层刻意不 import 任何 store / 数据库模块，所以由插件层注入这个查询能力。
+    查不到就返回 None，解析器会退化为显示 QQ 号 —— 「说的是谁」永远不丢。
+    """
+    try:
+        user = await get_user(int(qq))
+    except Exception:
+        return None
+    if user is None:
+        return None
+    return (user.latest_nickname or "").strip() or None
 
 
 # 消息事件匹配器：
@@ -193,7 +209,9 @@ async def handle(event: GroupMessageEvent, bot: Bot):
     #     Message Resolver 负责 text / image / reply / forward / file 的全部解释，
     #     插件层不再针对这些类型写 if/else 分支；日志只记数量统计，
     #     绝不输出图片 URL / Base64 / CDN token / 文件正文 / 转发正文。
-    resolver = MessageResolver(bot)
+    #     v0.9：把「QQ → 昵称」的查询能力注入解析器（感知层刻意不碰数据库），
+    #     这样「@某群友」会渲染成「@昵称」而不是被整段丢掉。
+    resolver = MessageResolver(bot, name_resolver=_resolve_mention_name)
     try:
         resolved = await resolver.resolve_event(event)
         conversation = await resolver.build_conversation(resolved)

@@ -45,6 +45,8 @@
 
 import asyncio
 import time
+from collections.abc import Awaitable
+from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
 
@@ -401,9 +403,14 @@ class MessageResolver:
         forward_max_images: int | None = None,
         forward_max_files: int | None = None,
         forward_max_text_chars: int | None = None,
+        name_resolver: Callable[[str], Awaitable[str | None]] | None = None,
     ) -> None:
         self.bot = bot
         self.budget = budget if budget is not None else ContentBudget()
+        # QQ → 昵称的查询能力，由插件层注入（感知层刻意不 import 任何 store /
+        # 数据库模块，保持「只回答发生了什么」的边界）。为 None 时 @ 提及退化为
+        # 显示 QQ 号，而不是整段丢弃。
+        self._name_resolver = name_resolver
         # 视觉能力在实例化时读取一次（与插件层同一份配置）：
         # 一次解析内部保持一致，不会出现“同一条消息里有的图片进模型、有的被丢弃”。
         self._vision_enabled = bool(getattr(vision_module, "VISION_ENABLED", False))
@@ -435,6 +442,8 @@ class MessageResolver:
         # 本次请求的「当前群」：群文件换下载直链时优先用它（机器人只对自己
         # 所在的群有取链接权限；合并转发里的文件属于原群，用原群会 1200）。
         self._request_group_id: int = 0
+        # 本次请求的机器人自身 QQ：用于把「@机器人」与「@别人」区分开。
+        self._request_self_id: int = 0
 
         # 待清理的图片临时目录（请求结束统一删除）
         self._temp_dirs: list[str] = []
@@ -464,6 +473,7 @@ class MessageResolver:
         self_id = _as_int(getattr(event, "self_id", 0))
         message_id = _as_int(getattr(event, "message_id", 0))
         self._request_group_id = group_id
+        self._request_self_id = self_id
 
         segments = as_segments(getattr(event, "message", None))
         if not segments:
@@ -627,7 +637,16 @@ class MessageResolver:
                 if text:
                     items.append(self._text_item(text, source=source, state=state))
             elif seg_type == "at":
-                # @ 本体不进入正文（与 event.get_plaintext() 语义一致）
+                # @ 本体不直接进正文（与 event.get_plaintext() 语义一致），
+                # 但**@ 别人**携带「说的是谁」这一关键信息，绝不能整段丢弃。
+                # 实测（2026-09-17）：用户 @ 了某群友并说「这个人欺负我」，
+                # 因为 at 段被 continue 掉，模型只看到「这个叫做 的人欺负我」，
+                # 只能回答「名字是空的。你让我去找谁」。
+                # 因此：@机器人 仍然丢弃（触发信息已由 conversation_mode 表达），
+                # @别人 渲染成「@昵称」（拿不到昵称时退化为 @QQ号）。
+                mention = await self._mention_item(data)
+                if mention is not None:
+                    items.append(mention)
                 continue
             elif seg_type == "image":
                 items.append(self._image_item(data, state=state, vision_enabled=vision_enabled))
@@ -671,6 +690,33 @@ class MessageResolver:
             else:
                 items.append(SystemNotice(text=UNKNOWN_SEGMENT_TEXT.format(segment_type=seg_type or "unknown")))
         return items, reply
+
+    # ===== @ 提及 =====
+
+    async def _mention_item(self, data: dict) -> TextContent | None:
+        """把 @ 段渲染成正文里的「@昵称」；返回 None 表示不该出现在正文里。
+
+        丢弃的两种情况：
+        - **@机器人自己**：触发信息已由 conversation_mode / to_me 表达，
+          正文里再出现一次「@夜子」只会干扰她理解「用户在跟谁说话」；
+        - 段里没有可用的 QQ（非法结构）。
+
+        昵称来自插件注入的 `name_resolver`（本地 users 表）。查不到 / 查询抛异常
+        一律退化为 `@QQ号` —— **绝不退回「整段丢弃」**，因为「说的是谁」比
+        「昵称好不好看」重要得多。
+        """
+        qq = _first_str(data, "qq", "user_id")
+        if not qq or not qq.isdigit():
+            return None
+        if self._request_self_id and qq == str(self._request_self_id):
+            return None
+        name = ""
+        if self._name_resolver is not None:
+            try:
+                name = _as_str(await self._name_resolver(qq)).strip()
+            except Exception:
+                name = ""
+        return TextContent(text=f"@{name or qq}")
 
     # ===== 图片 =====
 
